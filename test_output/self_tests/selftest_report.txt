@@ -1,0 +1,37 @@
+Self-test report
+================
+Test 1 (OSI learning): mean OSI=0.837, max OSI=0.967, mean rate=1.006 Hz
+Test 2 (Contrast pref stability): mean shift=3.7°, max shift=15.6° (n=32)
+Test 4 (PV feedforward): PV spikes=111 (contrast=2.0, w_e_pv=0)
+Test 5 (SOM geometry): in_var=4.000, out_var=0.562
+Test 6a (PV spread): max frac(in)=0.399, max frac(out)=0.399
+Test 6b (PV↔PV coupling): W_pv_pv present, diag=0
+Test 6c (VIP disinhibition): SOM spikes 5 -> 0, VIP spikes=396
+Test 6d (Apical scaffold): gain=0 spikes=4, gain=1 spikes=7
+Test 7 (Retinotopy caps): max(W-cap)=0.00e+00
+Test 9 (2D cortex geometry): dist2 wrap/metric OK (3×3, torus)
+Test 10 (RGC DoG isotropy): energy max/min=1.0081 (<=1.01)
+Test 11 (Pref diversity): tuned=31/32, resultant=0.365, max_gap=29.3°, mean=172.4°
+Test 12 (Alt stimuli smoke): sparse_spots + white_noise ran
+Test 13 (Alt stimuli drive): white_noise V1=1, sparse_spots V1=4
+Test 14 (White-noise OSI): mean OSI=0.459, max OSI=0.837, mean rate=0.660 Hz
+      (weights) rf_orientedness mean=0.229, grating-match OSI mean=0.201, ON/OFF corr mean=-0.164
+Test 15 (Sparse-spots OSI): mean OSI=0.276, max OSI=0.727, mean rate=1.076 Hz
+      (weights) rf_orientedness mean=0.370, grating-match OSI mean=0.244, ON/OFF corr mean=-0.273
+Test 16 (ON/OFF mosaics): mean OSI=0.598, angle=285.3°
+Test 17 (Laminar apical): L2/3 spikes off=0, on=2 (contrast=2.0)
+Test 18 (tuning_summary): pref_deg_peak OK, peak_rate_hz OK, OSI[flat]=0.0000
+Test 19 (E-E weight vs ori): monotonic decrease OK, first_bin_mean=0.9321, last_valid_mean=0.0319, OSI filter exclusion OK
+Test 20 (E-E delay sanity): spike at neuron 0 arrives at neuron 1 after 4 steps (=2.0 ms), g_exc_ee[1]=0.0150
+Test 21 (drive fraction): mean_frac=0.0000, per_ens range=[0.0000, 0.0000], stability diff=0.000000
+Test 22 (delay-aware STDP sign): w_init=0.1000, w_after_ltp=0.1039, w_after_ltd=0.0990
+Test 23 (delay-aware STDP bounds): ceiling=0.115120 (max=0.2), floor=0.077292 (min=0.0)
+Test 24 (sequence runner smoke): shapes OK, no NaNs, VEP trace len=500, metrics finite
+Test 25 (sequence STDP asymmetry): fwd_avg=0.25906 > rev_avg=0.22011 (BA=0.25906, CB=0.25906, AB=0.22011, BC=0.22011)
+Test 26 (peak-to-peak sanity): sin_p2p=7.966, seq_mag=5.975, flat_p2p=0.000
+Test 27 (scopolamine blocks): scopo |ΔW|_max=0.00e+00, normal |ΔW|_max=1.97e-01
+Test 29 (magnitude scoring): mag=11.477, rate=0.000, mag_active=YES
+Test 28 (drive_frac, N=8 M=32): OSI=0.862, peak_rate=4.08 Hz, cal_scale=677.1, cal_frac=0.1005, after_20_pres=0.3308
+Test 30 (fwd>rev, N=8 M=32): ratios=[1.000, 9.681, 9.625, 8.406, 8.386], final fwd=0.08271 rev=0.00986, pairs=115
+Test 31 (omission prediction, N=8 M=32): W_pred=[0.00000, 0.03273, 0.06047, 0.08013, 0.08984], g_ee_pred=[-0.00019, -0.00005, 0.00239, 0.00364, 0.00445]
+Test 32 (WTA diversity, random init, M=8): tuned=8/8, OSI=0.838, resultant=0.414, gap=80.3°
