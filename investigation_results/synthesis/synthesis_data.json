@@ -1,0 +1,138 @@
+{
+  "baseline_osi": 0.846,
+  "knockin": {
+    "KI_1_stdp_only": {
+      "condition": "KI_1_stdp_only",
+      "n_seeds": 3,
+      "final_mean_osi": 0.013515507520568954,
+      "final_sem_osi": 0.0009080689729167005,
+      "final_osi_per_seed": [
+        0.012162071877735565,
+        0.012663562318747996,
+        0.015720888365223305
+      ]
+    },
+    "KI_2_plus_het": {
+      "condition": "KI_2_plus_het",
+      "n_seeds": 3,
+      "final_mean_osi": 0.7923879647715172,
+      "final_sem_osi": 0.023877332591459903,
+      "final_osi_per_seed": [
+        0.8148637316932397,
+        0.7343879013087071,
+        0.8279122613126051
+      ]
+    },
+    "KI_3_plus_split": {
+      "condition": "KI_3_plus_split",
+      "n_seeds": 3,
+      "final_mean_osi": 0.7983582522777016,
+      "final_sem_osi": 0.012333749776774422,
+      "final_osi_per_seed": [
+        0.7976595708493613,
+        0.8248644297501389,
+        0.7725507562336043
+      ]
+    },
+    "KI_4_plus_pv": {
+      "condition": "KI_4_plus_pv",
+      "n_seeds": 3,
+      "final_mean_osi": 0.8292309309854096,
+      "final_sem_osi": 0.006682800718046039,
+      "final_osi_per_seed": [
+        0.8455968285696465,
+        0.8207525813406745,
+        0.8213433830459077
+      ]
+    },
+    "KI_5_plus_som": {
+      "condition": "KI_5_plus_som",
+      "n_seeds": 3,
+      "final_mean_osi": 0.8444929811077776,
+      "final_sem_osi": 0.004631611367771051,
+      "final_osi_per_seed": [
+        0.8547068724635501,
+        0.8436627777542144,
+        0.8351092931055686
+      ]
+    },
+    "KI_6_full_model": {
+      "condition": "KI_6_full_model",
+      "n_seeds": 3,
+      "final_mean_osi": 0.8462618943628284,
+      "final_sem_osi": 0.00811787116393761,
+      "final_osi_per_seed": [
+        0.8450987377530055,
+        0.829652354464433,
+        0.864034590871047
+      ]
+    }
+  },
+  "interaction_matrix": {
+    "HetxSplit": {
+      "neither": 0.013515507520568954,
+      "A_only": 0.7923879647715172,
+      "B_only": 0.6727201825385385,
+      "both": 0.7983582522777016,
+      "interaction": -0.6532343875117851
+    },
+    "HetxPV": {
+      "neither": 0.013515507520568954,
+      "A_only": 0.7923879647715172,
+      "B_only": 0.01328631921271136,
+      "both": 0.5846263393967305,
+      "interaction": -0.20753243706692912
+    },
+    "SplitxPV": {
+      "neither": 0.013515507520568954,
+      "A_only": 0.6727201825385385,
+      "B_only": 0.01328631921271136,
+      "both": 0.7145810716672978,
+      "interaction": 0.042090077436616885
+    }
+  },
+  "rankings": [
+    [
+      "1",
+      "Triplet STDP (M1)",
+      "0.200",
+      "-0.646",
+      "**ESSENTIAL**"
+    ],
+    [
+      "2",
+      "ON/OFF Split (M3)",
+      "0.522",
+      "-0.324",
+      "**IMPORTANT** (synergistic)"
+    ],
+    [
+      "3",
+      "Heterosynaptic Depression (M2)",
+      "0.745",
+      "-0.101",
+      "Facilitating"
+    ],
+    [
+      "4",
+      "PV Inhibition (M4)",
+      "0.824",
+      "-0.022",
+      "Modulatory"
+    ],
+    [
+      "5",
+      "SOM Inhibition (M5)",
+      "0.837",
+      "-0.009",
+      "Modulatory"
+    ],
+    [
+      "6",
+      "TC STP (M6)",
+      "0.844",
+      "-0.002",
+      "Neutral"
+    ]
+  ]
+}

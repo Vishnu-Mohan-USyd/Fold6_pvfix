@@ -1,0 +1,61 @@
+/home/vysoforlife/miniconda3/envs/habitat/lib/python3.9/site-packages/scipy/__init__.py:146: UserWarning: A NumPy version >=1.17.3 and <1.25.0 is required for this version of SciPy (detected version 1.26.4
+  warnings.warn(f"A NumPy version >={np_minversion} and <{np_maxversion}"
+======================================================================
+Diagnostic: 2x STDP rates + 2x w_max (800 presentations)
+======================================================================
+
+Phase A (100 segments)...
+  50/100
+  100/100
+  Mean OSI: 0.809
+Calibrating...
+  [calibrate_jax] scale=1 → drive_frac=0.0001
+  [calibrate_jax] scale=5 → drive_frac=0.0005
+  [calibrate_jax] scale=20 → drive_frac=0.0019
+  [calibrate_jax] scale=50 → drive_frac=0.0048
+  [calibrate_jax] scale=100 → drive_frac=0.0096
+  [calibrate_jax] scale=200 → drive_frac=0.0191
+  [calibrate_jax] scale=500 → drive_frac=0.0499
+  [calibrate_jax] scale=1000 → drive_frac=0.1586
+  [calibrate_jax] scale=2000 → drive_frac=0.7173
+  [calibrate_jax] refine scale=707.1 → drive_frac=0.0888
+  [calibrate_jax] refine scale=840.9 → drive_frac=0.1148
+  [calibrate_jax] refine scale=917.0 → drive_frac=0.1239
+  [calibrate_jax] refine scale=957.6 → drive_frac=0.1315
+  [calibrate_jax] WARNING: OSI=0.217 < floor=0.30 at scale=1000.0
+  [calibrate_jax] back-off scale=957.6 → OSI=0.195, drive_frac=0.1315
+  [calibrate_jax] back-off scale=917.0 → OSI=0.203, drive_frac=0.1239
+  [calibrate_jax] back-off scale=840.9 → OSI=0.300, drive_frac=0.1148
+  [calibrate_jax] Final: scale=840.9 → drive_frac=0.1148, OSI=0.300
+  scale=840.9, frac=0.1148
+  cal_mean=1.6818, w_max(2x)=3.3636
+JIT warmup...
+
+--- 1x rates (A+=0.005, A-=0.006) ---
+  [pres 100] F>R=1.0265 (fwd=1.620468, rev=1.578644), W_ee mean=1.60238 max=1.9591, 48s
+  [pres 200] F>R=1.0576 (fwd=1.581374, rev=1.495246), W_ee mean=1.54134 max=2.1306, 63s
+  [pres 400] F>R=1.1254 (fwd=1.562357, rev=1.388313), W_ee mean=1.47926 max=2.5192, 94s
+  [pres 600] F>R=1.1817 (fwd=1.528908, rev=1.293782), W_ee mean=1.42193 max=2.7638, 125s
+  [pres 800] F>R=1.2265 (fwd=1.524644, rev=1.243132), W_ee mean=1.39559 max=2.9266, 157s
+  Trajectory: 1.000 → 1.026 → 1.058 → 1.125 → 1.182 → 1.226
+  Final F>R: 1.2265 FAIL (<1.5)
+
+--- 2x rates (A+=0.01, A-=0.012) ---
+  [pres 100] F>R=1.0448 (fwd=1.568671, rev=1.501343), W_ee mean=1.54268 max=2.1771, 19s
+  [pres 200] F>R=1.1175 (fwd=1.529623, rev=1.368806), W_ee mean=1.46062 max=2.5392, 38s
+  [pres 400] F>R=1.2216 (fwd=1.496544, rev=1.225101), W_ee mean=1.38194 max=2.9634, 75s
+  [pres 600] F>R=1.2272 (fwd=1.400229, rev=1.141000), W_ee mean=1.30737 max=3.0103, 112s
+  [pres 800] F>R=1.2060 (fwd=1.356961, rev=1.125181), W_ee mean=1.28503 max=3.0621, 149s
+  Trajectory: 1.000 → 1.045 → 1.117 → 1.222 → 1.227 → 1.206
+  Final F>R: 1.2060 FAIL (<1.5)
+
+--- 3x rates (A+=0.015, A-=0.018) ---
+  [pres 100] F>R=1.0747 (fwd=1.534885, rev=1.428136), W_ee mean=1.49819 max=2.3860, 19s
+  [pres 200] F>R=1.1723 (fwd=1.486505, rev=1.268025), W_ee mean=1.39526 max=2.7826, 38s
+  [pres 400] F>R=1.2206 (fwd=1.423227, rev=1.166024), W_ee mean=1.32234 max=3.0292, 76s
+  [pres 600] F>R=1.1709 (fwd=1.289092, rev=1.100922), W_ee mean=1.23875 max=3.1659, 113s
+  [pres 800] F>R=1.1430 (fwd=1.277921, rev=1.118018), W_ee mean=1.24779 max=3.2577, 151s
+  Trajectory: 1.000 → 1.075 → 1.172 → 1.221 → 1.171 → 1.143
+  Final F>R: 1.1430 FAIL (<1.5)
+
+======================================================================

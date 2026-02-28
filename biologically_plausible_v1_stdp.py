@@ -425,6 +425,19 @@ class Params:
     M: int = 8  # Number of V1 ensembles (like a hypercolumn)
     cortex_shape: Tuple[int, int] | None = None  # (H,W) for 2D sheet; None => (1,M)
     cortex_wrap: bool = True  # periodic boundary for lateral distance computations
+
+    # Multi-hypercolumn retinotopic grid
+    n_hc: int = 1                          # Number of hypercolumns (1=legacy, 4=2x2)
+    hc_grid_shape: Tuple[int, int] | None = None  # (H,W); None => auto square
+    rf_spacing_pix: float = 4.0            # Retinal spacing between HC centers (pixels)
+
+    # Inter-HC horizontal connections
+    inter_hc_w_e_e: float = 0.005          # Initial inter-HC E→E weight
+    inter_hc_delay_base_ms: float = 4.0    # Base conduction delay for adjacent HCs
+    inter_hc_delay_range_ms: float = 8.0   # Range (adjacent=base, diagonal=base+range)
+    inter_hc_som_w_e_som: float = 0.05     # Inter-HC E→SOM weight
+    inter_hc_som_w_som_e: float = 0.05     # Inter-HC SOM→E weight
+
     dt_ms: float = 0.5  # Time step (smaller for Izhikevich stability)
 
     # Training
@@ -513,12 +526,12 @@ class Params:
 
     # Thalamocortical short-term synaptic depression (STP) at LGN->V1 synapses.
     # This is a local, fast gain-control mechanism that complements slower homeostatic plasticity.
-    tc_stp_enabled: bool = True
+    tc_stp_enabled: bool = False
     tc_stp_u: float = 0.05          # per-spike depletion fraction (0..1)
     tc_stp_tau_rec: float = 50.0    # ms recovery time constant
     # Thalamocortical STP at LGN->PV synapses (feedforward inhibition pathway).
     # Kept separate because depression dynamics can differ between PV/FS and pyramidal targets.
-    tc_stp_pv_enabled: bool = True
+    tc_stp_pv_enabled: bool = False
     tc_stp_pv_u: float = 0.05
     tc_stp_pv_tau_rec: float = 50.0
 
@@ -613,10 +626,10 @@ class Params:
     eta_pv_istdp: float = 0.0001
     w_pv_e_max: float = 8.0
     # E->SOM (lateral inhibition drive from this ensemble)
-    w_e_som: float = 6.0
+    w_e_som: float = 0.0
     # SOM->E (lateral inhibition TO OTHER ensembles - NOT self)
     # NOTE: Treated as a GABA conductance increment (not subtractive current).
-    w_som_e: float = 0.05
+    w_som_e: float = 0.0
 
     # SOM lateral circuit spatial scales (in "ensemble index" distance; circular)
     som_in_sigma: float = 2.0   # E->SOM spread (can be longer-range)
@@ -881,8 +894,8 @@ class TripletSTDP:
             # weaken their OFF counterparts (and vice versa). This encourages development of phase-
             # opponent ON/OFF subfields under non-oriented developmental stimuli (spots/noise),
             # without requiring any global weight normalization.
-            if p.A_split > 0 and self.n_pre == 2 * p.N * p.N:
-                n_pix = int(p.N) * int(p.N)
+            if p.A_split > 0 and self.n_pre % (2 * p.N * p.N) == 0:
+                n_pix = self.n_pre // 2
                 on_trace = self.x_pre[:, :n_pix]
                 off_trace = self.x_pre[:, n_pix:]
                 split_gain = np.ones_like(post_mask, dtype=np.float32)
@@ -1220,25 +1233,75 @@ class RgcLgnV1Network:
         self.M = p.M  # Number of V1 ensembles
         self.L = p.delay_max + 1  # Delay buffer length
 
-        # Cortical geometry for lateral connectivity (defaults to a 1×M ring).
-        if p.cortex_shape is None:
-            cortex_h, cortex_w = 1, int(p.M)
+        # --- Multi-hypercolumn setup ---
+        self.n_hc = max(1, p.n_hc)
+        self.M_per_hc = p.M                    # p.M stays as per-HC count
+        if self.n_hc > 1:
+            self.M = self.n_hc * p.M           # Override M to M_total
+        self.n_pix_per_hc = p.N * p.N          # 64 for N=8
+        self.n_lgn_per_hc = 2 * p.N * p.N      # 128 for N=8
+        if self.n_hc > 1:
+            self.n_lgn = self.n_hc * self.n_lgn_per_hc
+        self.hc_id = np.repeat(np.arange(self.n_hc), self.M_per_hc)  # (M_total,)
+
+        # Cortical geometry for lateral connectivity.
+        if self.n_hc > 1:
+            # Multi-HC: each HC occupies a contiguous block in 2D cortex.
+            hc_side = math.isqrt(self.M_per_hc)
+            if hc_side * hc_side != self.M_per_hc:
+                raise ValueError(f"M_per_hc={self.M_per_hc} must be a perfect square for multi-HC layout")
+            if p.hc_grid_shape is not None:
+                hc_grid_h, hc_grid_w = int(p.hc_grid_shape[0]), int(p.hc_grid_shape[1])
+            else:
+                hc_grid_w = math.isqrt(self.n_hc)
+                if hc_grid_w * hc_grid_w != self.n_hc:
+                    hc_grid_w = self.n_hc
+                    hc_grid_h = 1
+                else:
+                    hc_grid_h = hc_grid_w
+            if hc_grid_h * hc_grid_w != self.n_hc:
+                raise ValueError(f"hc_grid_shape {(hc_grid_h, hc_grid_w)} doesn't match n_hc={self.n_hc}")
+            self.hc_grid_h = hc_grid_h
+            self.hc_grid_w = hc_grid_w
+            cortex_h = hc_grid_h * hc_side
+            cortex_w = hc_grid_w * hc_side
+            self.cortex_h = cortex_h
+            self.cortex_w = cortex_w
+            self.cortex_x = np.zeros(self.M, dtype=np.int32)
+            self.cortex_y = np.zeros(self.M, dtype=np.int32)
+            for i in range(self.M):
+                hc = i // self.M_per_hc
+                m_local = i % self.M_per_hc
+                hc_x = hc % hc_grid_w
+                hc_y = hc // hc_grid_w
+                self.cortex_x[i] = hc_x * hc_side + m_local % hc_side
+                self.cortex_y[i] = hc_y * hc_side + m_local // hc_side
+            # No wrapping for multi-HC
+            dx = np.abs(self.cortex_x[:, None] - self.cortex_x[None, :]).astype(np.int32)
+            dy = np.abs(self.cortex_y[:, None] - self.cortex_y[None, :]).astype(np.int32)
+            self.cortex_dist2 = (dx * dx + dy * dy).astype(np.float32)
         else:
-            cortex_h, cortex_w = int(p.cortex_shape[0]), int(p.cortex_shape[1])
-            if cortex_h <= 0 or cortex_w <= 0 or (cortex_h * cortex_w) != int(p.M):
-                raise ValueError("cortex_shape must be (H,W) with H*W == M and H,W>0")
-        self.cortex_h = cortex_h
-        self.cortex_w = cortex_w
-        idxs = np.arange(p.M, dtype=np.int32)
-        self.cortex_x = (idxs % cortex_w).astype(np.int32)
-        self.cortex_y = (idxs // cortex_w).astype(np.int32)
-        # Squared distances between ensembles (used by Gaussian lateral kernels).
-        dx = np.abs(self.cortex_x[:, None] - self.cortex_x[None, :]).astype(np.int32)
-        dy = np.abs(self.cortex_y[:, None] - self.cortex_y[None, :]).astype(np.int32)
-        if p.cortex_wrap:
-            dx = np.minimum(dx, cortex_w - dx)
-            dy = np.minimum(dy, cortex_h - dy)
-        self.cortex_dist2 = (dx * dx + dy * dy).astype(np.float32)
+            # Legacy single-HC
+            self.hc_grid_h = 1
+            self.hc_grid_w = 1
+            if p.cortex_shape is None:
+                cortex_h, cortex_w = 1, int(p.M)
+            else:
+                cortex_h, cortex_w = int(p.cortex_shape[0]), int(p.cortex_shape[1])
+                if cortex_h <= 0 or cortex_w <= 0 or (cortex_h * cortex_w) != int(p.M):
+                    raise ValueError("cortex_shape must be (H,W) with H*W == M and H,W>0")
+            self.cortex_h = cortex_h
+            self.cortex_w = cortex_w
+            idxs = np.arange(p.M, dtype=np.int32)
+            self.cortex_x = (idxs % cortex_w).astype(np.int32)
+            self.cortex_y = (idxs // cortex_w).astype(np.int32)
+            # Squared distances between ensembles (used by Gaussian lateral kernels).
+            dx = np.abs(self.cortex_x[:, None] - self.cortex_x[None, :]).astype(np.int32)
+            dy = np.abs(self.cortex_y[:, None] - self.cortex_y[None, :]).astype(np.int32)
+            if p.cortex_wrap:
+                dx = np.minimum(dx, cortex_w - dx)
+                dy = np.minimum(dy, cortex_h - dy)
+            self.cortex_dist2 = (dx * dx + dy * dy).astype(np.float32)
 
         # Spatial coordinates for RGC mosaics (used to sample stimuli and build retinotopic priors).
         xs = np.arange(p.N, dtype=np.float32) - (p.N - 1) / 2.0
@@ -1305,6 +1368,33 @@ class RgcLgnV1Network:
         # In separated-mosaic mode, these refer to the ON mosaic.
         self.X, self.Y = self.X_on, self.Y_on
 
+        # Per-HC RGC mosaic coordinate lists.
+        if self.n_hc > 1:
+            # Compute hc_grid offsets using rf_spacing_pix, centered at origin.
+            if p.hc_grid_shape is not None:
+                hc_grid_h_rf, hc_grid_w_rf = int(p.hc_grid_shape[0]), int(p.hc_grid_shape[1])
+            else:
+                hc_grid_h_rf, hc_grid_w_rf = self.hc_grid_h, self.hc_grid_w
+            self.X_on_hcs = []
+            self.Y_on_hcs = []
+            self.X_off_hcs = []
+            self.Y_off_hcs = []
+            for hc in range(self.n_hc):
+                hc_col = hc % hc_grid_w_rf
+                hc_row = hc // hc_grid_w_rf
+                # Center the grid at origin
+                ox = (hc_col - (hc_grid_w_rf - 1) / 2.0) * p.rf_spacing_pix
+                oy = (hc_row - (hc_grid_h_rf - 1) / 2.0) * p.rf_spacing_pix
+                self.X_on_hcs.append((self.X_on + ox).astype(np.float32))
+                self.Y_on_hcs.append((self.Y_on + oy).astype(np.float32))
+                self.X_off_hcs.append((self.X_off + ox).astype(np.float32))
+                self.Y_off_hcs.append((self.Y_off + oy).astype(np.float32))
+        else:
+            self.X_on_hcs = [self.X_on]
+            self.Y_on_hcs = [self.Y_on]
+            self.X_off_hcs = [self.X_off]
+            self.Y_off_hcs = [self.Y_off]
+
         # RGC center–surround DoG front-end.
         # Important for biological plausibility AND for avoiding orientation-biased learning: small patches
         # with truncated DoG kernels can introduce systematic oblique biases. The default "padded_fft"
@@ -1366,17 +1456,32 @@ class RgcLgnV1Network:
 
         # Retinotopic envelopes (fixed structural locality) for thalamocortical projections.
         # Implemented as a spatially varying *cap* on synaptic weights (far inputs cannot become strong).
+        # For multi-HC, d2 is relative to each HC's own center (always same shape), so use HC0's coords.
         d2_on = (self.X_on.astype(np.float32) ** 2 + self.Y_on.astype(np.float32) ** 2).astype(np.float32)
         d2_off = (self.X_off.astype(np.float32) ** 2 + self.Y_off.astype(np.float32) ** 2).astype(np.float32)
 
         def lgn_mask_vec(sigma: float) -> np.ndarray:
             if sigma <= 0:
                 return np.ones(self.n_lgn, dtype=np.float32)
-            pix_on = np.exp(-d2_on / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
-            pix_off = np.exp(-d2_off / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
-            vec = np.concatenate([pix_on, pix_off]).astype(np.float32)
-            vec /= float(vec.max() + 1e-12)
-            return vec
+            if self.n_hc > 1:
+                # Per-HC envelopes concatenated in [ALL_ON | ALL_OFF] layout
+                on_parts = []
+                off_parts = []
+                for hc in range(self.n_hc):
+                    # d2 is relative to each HC's own center — same for all HCs
+                    pix_on = np.exp(-d2_on / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
+                    pix_off = np.exp(-d2_off / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
+                    on_parts.append(pix_on)
+                    off_parts.append(pix_off)
+                vec = np.concatenate(on_parts + off_parts).astype(np.float32)
+                vec /= float(vec.max() + 1e-12)
+                return vec
+            else:
+                pix_on = np.exp(-d2_on / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
+                pix_off = np.exp(-d2_off / (2.0 * float(sigma) * float(sigma))).astype(np.float32).ravel()
+                vec = np.concatenate([pix_on, pix_off]).astype(np.float32)
+                vec /= float(vec.max() + 1e-12)
+                return vec
 
         self._lgn_mask_e_vec = lgn_mask_vec(p.lgn_sigma_e)
         self._lgn_mask_pv_vec = lgn_mask_vec(p.lgn_sigma_pv)
@@ -1385,7 +1490,7 @@ class RgcLgnV1Network:
         self.lgn = IzhikevichPopulation(self.n_lgn, TC_PARAMS, p.dt_ms, self.rng)
 
         # --- V1 Excitatory Layer (Regular spiking) ---
-        self.v1_exc = IzhikevichPopulation(p.M, RS_PARAMS, p.dt_ms, self.rng)
+        self.v1_exc = IzhikevichPopulation(self.M, RS_PARAMS, p.dt_ms, self.rng)
 
         # --- Optional L2/3 Excitatory Layer (Regular spiking) ---
         # Enabled via `Params.laminar_enabled`. This population is driven by L4 and is where
@@ -1393,20 +1498,20 @@ class RgcLgnV1Network:
         self.v1_l23 = None
         if p.laminar_enabled:
             l23_rng = np.random.default_rng(np.random.SeedSequence([p.seed, 33333, 0]))
-            self.v1_l23 = IzhikevichPopulation(p.M, RS_PARAMS, p.dt_ms, l23_rng)
+            self.v1_l23 = IzhikevichPopulation(self.M, RS_PARAMS, p.dt_ms, l23_rng)
 
         # --- Local PV Interneurons (Fast spiking) ---
         # One PV per ensemble for local feedforward inhibition
-        self.n_pv = p.M * p.n_pv_per_ensemble
+        self.n_pv = self.M * p.n_pv_per_ensemble
         self.pv = IzhikevichPopulation(self.n_pv, FS_PARAMS, p.dt_ms, self.rng)
 
         # --- SOM Interneurons (Low-threshold spiking) ---
         # Each ensemble has its own SOM neuron for lateral inhibition
-        self.n_som = p.M * p.n_som_per_ensemble
+        self.n_som = self.M * p.n_som_per_ensemble
         self.som = IzhikevichPopulation(self.n_som, LTS_PARAMS, p.dt_ms, self.rng)
 
         # --- VIP Interneurons (disinhibitory: VIP -> SOM -> E), optional ---
-        self.n_vip = p.M * p.n_vip_per_ensemble
+        self.n_vip = self.M * p.n_vip_per_ensemble
         self.vip = None
         if self.n_vip > 0:
             vip_rng = np.random.default_rng(np.random.SeedSequence([p.seed, 22222, 0]))
@@ -1416,31 +1521,31 @@ class RgcLgnV1Network:
         self.I_lgn = np.zeros(self.n_lgn, dtype=np.float32)
         # Split basal excitatory AMPA conductance into feedforward + recurrent E→E components.
         # g_v1_exc = g_exc_ff + g_exc_ee  (total used in membrane equation)
-        self.g_exc_ff = np.zeros(p.M, dtype=np.float32)   # feedforward (LGN→V1)
-        self.g_exc_ee = np.zeros(p.M, dtype=np.float32)   # recurrent (E→E lateral)
+        self.g_exc_ff = np.zeros(self.M, dtype=np.float32)   # feedforward (LGN→V1)
+        self.g_exc_ee = np.zeros(self.M, dtype=np.float32)   # recurrent (E→E lateral)
         # Drive fraction accumulators (for time-averaged logging within a segment)
-        self._drive_acc_ff = np.zeros(p.M, dtype=np.float64)
-        self._drive_acc_ee = np.zeros(p.M, dtype=np.float64)
+        self._drive_acc_ff = np.zeros(self.M, dtype=np.float64)
+        self._drive_acc_ee = np.zeros(self.M, dtype=np.float64)
         self._drive_acc_steps = 0
-        self.g_v1_apical = np.zeros(p.M, dtype=np.float32)  # apical/feedback-like excitatory conductance
+        self.g_v1_apical = np.zeros(self.M, dtype=np.float32)  # apical/feedback-like excitatory conductance
         # L2/3 excitatory (optional, laminar mode). These are inert when `v1_l23 is None`.
-        self.g_l23_exc = np.zeros(p.M, dtype=np.float32)
-        self.g_l23_apical = np.zeros(p.M, dtype=np.float32)
-        self.g_l23_inh_som = np.zeros(p.M, dtype=np.float32)
-        self.I_l23_bias = np.zeros(p.M, dtype=np.float32)
+        self.g_l23_exc = np.zeros(self.M, dtype=np.float32)
+        self.g_l23_apical = np.zeros(self.M, dtype=np.float32)
+        self.g_l23_inh_som = np.zeros(self.M, dtype=np.float32)
+        self.I_l23_bias = np.zeros(self.M, dtype=np.float32)
         self.I_pv = np.zeros(self.n_pv, dtype=np.float32)
         self.I_som = np.zeros(self.n_som, dtype=np.float32)
         self.I_som_inh = np.zeros(self.n_som, dtype=np.float32)  # VIP->SOM inhibition (current-based)
         self.I_vip = np.zeros(self.n_vip, dtype=np.float32)
 
         # Intrinsic excitability homeostasis (bias current) for V1 excitatory neurons
-        self.I_v1_bias = np.full(p.M, p.v1_bias_init, dtype=np.float32)
+        self.I_v1_bias = np.full(self.M, p.v1_bias_init, dtype=np.float32)
 
         # Thalamocortical STP state (LGN->E): available resources per synapse (1 = fully recovered).
         self.tc_stp_x = None
         self.tc_stp_rec_alpha = 0.0
         if p.tc_stp_enabled and p.tc_stp_tau_rec > 0:
-            self.tc_stp_x = np.ones((p.M, self.n_lgn), dtype=np.float32)
+            self.tc_stp_x = np.ones((self.M, self.n_lgn), dtype=np.float32)
             self.tc_stp_rec_alpha = float(1.0 - math.exp(-p.dt_ms / float(p.tc_stp_tau_rec)))
 
         # Thalamocortical STP state (LGN->PV): available resources per synapse (1 = fully recovered).
@@ -1459,13 +1564,13 @@ class RgcLgnV1Network:
         # Inhibitory conductances onto V1 excitatory neurons.
         # PV inhibition uses a difference-of-exponentials (rise + decay) to avoid unrealistically
         # zero-lag inhibition in a discrete-time update.
-        self.g_v1_inh_pv_rise = np.zeros(p.M, dtype=np.float32)
-        self.g_v1_inh_pv_decay = np.zeros(p.M, dtype=np.float32)
-        self.g_v1_inh_som = np.zeros(p.M, dtype=np.float32)
+        self.g_v1_inh_pv_rise = np.zeros(self.M, dtype=np.float32)
+        self.g_v1_inh_pv_decay = np.zeros(self.M, dtype=np.float32)
+        self.g_v1_inh_som = np.zeros(self.M, dtype=np.float32)
 
         # Previous-step spikes (for delayed recurrent effects)
-        self.prev_v1_spk = np.zeros(p.M, dtype=np.uint8)
-        self.prev_v1_l23_spk = np.zeros(p.M, dtype=np.uint8)
+        self.prev_v1_spk = np.zeros(self.M, dtype=np.uint8)
+        self.prev_v1_l23_spk = np.zeros(self.M, dtype=np.uint8)
 
         # --- Delay buffer for LGN->V1 ---
         self.delay_buf = np.zeros((self.L, self.n_lgn), dtype=np.uint8)
@@ -1473,93 +1578,193 @@ class RgcLgnV1Network:
         self.lgn_ids = np.arange(self.n_lgn)[None, :]
 
         # Random delays (no orientation bias)
-        self.D = self.rng.integers(0, self.L, size=(p.M, self.n_lgn),
+        self.D = self.rng.integers(0, self.L, size=(self.M, self.n_lgn),
                                    endpoint=False, dtype=np.int16)
 
         # --- LGN->V1 weights (unbiased initialization) ---
         if init_mode == "random":
             W = self.rng.normal(p.w_init_mean, p.w_init_std,
-                               size=(p.M, self.n_lgn)).astype(np.float32)
+                               size=(self.M, self.n_lgn)).astype(np.float32)
         elif init_mode == "near_uniform":
             W = (p.w_init_mean + self.rng.normal(0, p.w_init_std * 0.05,
-                                                  size=(p.M, self.n_lgn))).astype(np.float32)
+                                                  size=(self.M, self.n_lgn))).astype(np.float32)
         elif init_mode == "seeded":
             # Start near-uniform, then add per-ensemble oriented Gabor seed.
             # Models genetically guided axon targeting that pre-biases orientation
             # maps before visual experience (McLaughlin & O'Leary 2005, Ackman & Bhatt 2014).
             W = (p.w_init_mean + self.rng.normal(0, p.w_init_std * 0.05,
-                                                  size=(p.M, self.n_lgn))).astype(np.float32)
-            N2 = p.N * p.N
-            x_on = self.X_on.ravel().astype(np.float64)
-            y_on = self.Y_on.ravel().astype(np.float64)
-            x_off = self.X_off.ravel().astype(np.float64)
-            y_off = self.Y_off.ravel().astype(np.float64)
-            mask_on = self._lgn_mask_e_vec[:N2].astype(np.float64)
-            mask_off = self._lgn_mask_e_vec[N2:].astype(np.float64)
-            seed_strength = 0.08  # ~30% of w_init_mean (0.25); tunable
+                                                  size=(self.M, self.n_lgn))).astype(np.float32)
+            n_pix = self.n_lgn // 2  # total ON (or OFF) pixels
 
-            # Two-pass matched-filter normalization to eliminate cardinal
-            # orientation bias from Gabor seeding on discrete lattice.
-            # The tanh(perp) seed creates maximally structured patterns for
-            # cardinal orientations (0°/90°) because the perpendicular axis
-            # aligns with integer grid coordinates, producing a larger
-            # matched-filter response (dot product with preferred grating)
-            # than oblique orientations.  This 2-pass approach equalizes
-            # the effective selectivity across all seed orientations.
-            sf = float(p.spatial_freq)
-            tf = float(p.temporal_freq)
-            n_mf_phases = 36  # sample one temporal cycle for matched-filter score
+            if self.n_hc > 1:
+                # Multi-HC seeded init: each HC independently covers 0-180° with M_per_hc orientations.
+                seed_strength = 0.08
+                sf = float(p.spatial_freq)
+                tf = float(p.temporal_freq)
+                n_mf_phases = 36
 
-            # Pass 1: compute all biases and their matched-filter scores
-            biases = []
-            match_scores = []
-            for m in range(p.M):
-                th = np.radians(m * 180.0 / p.M)
-                # Perpendicular coordinate: distance from oriented bar center
-                perp_on = -x_on * np.sin(th) + y_on * np.cos(th)
-                perp_off = -x_off * np.sin(th) + y_off * np.cos(th)
-                # Simple half-wave bias: one side of bar gets ON, other gets OFF
-                bias_on = np.tanh(perp_on) * seed_strength * mask_on
-                bias_off = -np.tanh(perp_off) * seed_strength * mask_off
-                biases.append((bias_on.copy(), bias_off.copy()))
+                for hc in range(self.n_hc):
+                    m_start = hc * self.M_per_hc
+                    on_start = hc * self.n_pix_per_hc
+                    on_end = on_start + self.n_pix_per_hc
+                    off_start = n_pix + hc * self.n_pix_per_hc
+                    off_end = off_start + self.n_pix_per_hc
 
-                # Matched-filter score: avg over one temporal cycle of
-                # dot(bias, rectified_grating_input_at_preferred_theta)
-                cos_th = np.cos(th)
-                sin_th = np.sin(th)
-                score = 0.0
-                for k in range(n_mf_phases):
-                    t_s = k / (tf * n_mf_phases)  # sample one cycle
-                    phase_on = 2.0 * np.pi * (sf * (x_on * cos_th + y_on * sin_th) - tf * t_s)
-                    phase_off = 2.0 * np.pi * (sf * (x_off * cos_th + y_off * sin_th) - tf * t_s)
-                    g_on = np.sin(phase_on)
-                    g_off = np.sin(phase_off)
-                    lgn_on = np.clip(g_on, 0.0, None) * mask_on
-                    lgn_off = np.clip(-g_off, 0.0, None) * mask_off
-                    score += float(np.dot(bias_on, lgn_on) + np.dot(bias_off, lgn_off))
-                match_scores.append(score / n_mf_phases)
+                    x_on = self.X_on_hcs[hc].ravel().astype(np.float64)
+                    y_on = self.Y_on_hcs[hc].ravel().astype(np.float64)
+                    x_off = self.X_off_hcs[hc].ravel().astype(np.float64)
+                    y_off = self.Y_off_hcs[hc].ravel().astype(np.float64)
+                    mask_on = self._lgn_mask_e_vec[on_start:on_end].astype(np.float64)
+                    mask_off = self._lgn_mask_e_vec[off_start:off_end].astype(np.float64)
 
-            # Pass 2: scale all biases to median matched-filter score
-            target_score = float(np.median(match_scores))
-            for m in range(p.M):
-                bias_on, bias_off = biases[m]
-                if abs(match_scores[m]) > 1e-12:
-                    scale = target_score / match_scores[m]
-                    W[m, :N2] += (bias_on * scale).astype(np.float32)
-                    W[m, N2:] += (bias_off * scale).astype(np.float32)
-                else:
-                    W[m, :N2] += bias_on.astype(np.float32)
-                    W[m, N2:] += bias_off.astype(np.float32)
+                    biases = []
+                    match_scores = []
+                    for m_local in range(self.M_per_hc):
+                        th = np.radians(m_local * 180.0 / self.M_per_hc)
+                        perp_on = -x_on * np.sin(th) + y_on * np.cos(th)
+                        perp_off = -x_off * np.sin(th) + y_off * np.cos(th)
+                        bias_on = np.tanh(perp_on) * seed_strength * mask_on
+                        bias_off = -np.tanh(perp_off) * seed_strength * mask_off
+                        biases.append((bias_on.copy(), bias_off.copy()))
+
+                        cos_th = np.cos(th)
+                        sin_th = np.sin(th)
+                        score = 0.0
+                        for k in range(n_mf_phases):
+                            t_s = k / (tf * n_mf_phases)
+                            phase_on = 2.0 * np.pi * (sf * (x_on * cos_th + y_on * sin_th) - tf * t_s)
+                            phase_off = 2.0 * np.pi * (sf * (x_off * cos_th + y_off * sin_th) - tf * t_s)
+                            g_on = np.sin(phase_on)
+                            g_off = np.sin(phase_off)
+                            lgn_on = np.clip(g_on, 0.0, None) * mask_on
+                            lgn_off = np.clip(-g_off, 0.0, None) * mask_off
+                            score += float(np.dot(bias_on, lgn_on) + np.dot(bias_off, lgn_off))
+                        match_scores.append(score / n_mf_phases)
+
+                    target_score = float(np.median(match_scores))
+                    for m_local in range(self.M_per_hc):
+                        m_global = m_start + m_local
+                        bias_on, bias_off = biases[m_local]
+                        if abs(match_scores[m_local]) > 1e-12:
+                            scale = target_score / match_scores[m_local]
+                            W[m_global, on_start:on_end] += (bias_on * scale).astype(np.float32)
+                            W[m_global, off_start:off_end] += (bias_off * scale).astype(np.float32)
+                        else:
+                            W[m_global, on_start:on_end] += bias_on.astype(np.float32)
+                            W[m_global, off_start:off_end] += bias_off.astype(np.float32)
+            else:
+                # Legacy single-HC seeded init
+                N2 = p.N * p.N
+                x_on = self.X_on.ravel().astype(np.float64)
+                y_on = self.Y_on.ravel().astype(np.float64)
+                x_off = self.X_off.ravel().astype(np.float64)
+                y_off = self.Y_off.ravel().astype(np.float64)
+                mask_on = self._lgn_mask_e_vec[:N2].astype(np.float64)
+                mask_off = self._lgn_mask_e_vec[N2:].astype(np.float64)
+                seed_strength = 0.08  # ~30% of w_init_mean (0.25); tunable
+
+                # Two-pass matched-filter normalization to eliminate cardinal
+                # orientation bias from Gabor seeding on discrete lattice.
+                sf = float(p.spatial_freq)
+                tf = float(p.temporal_freq)
+                n_mf_phases = 36  # sample one temporal cycle for matched-filter score
+
+                # Pass 1: compute all biases and their matched-filter scores
+                biases = []
+                match_scores = []
+                for m in range(self.M):
+                    th = np.radians(m * 180.0 / self.M)
+                    perp_on = -x_on * np.sin(th) + y_on * np.cos(th)
+                    perp_off = -x_off * np.sin(th) + y_off * np.cos(th)
+                    bias_on = np.tanh(perp_on) * seed_strength * mask_on
+                    bias_off = -np.tanh(perp_off) * seed_strength * mask_off
+                    biases.append((bias_on.copy(), bias_off.copy()))
+
+                    cos_th = np.cos(th)
+                    sin_th = np.sin(th)
+                    score = 0.0
+                    for k in range(n_mf_phases):
+                        t_s = k / (tf * n_mf_phases)
+                        phase_on = 2.0 * np.pi * (sf * (x_on * cos_th + y_on * sin_th) - tf * t_s)
+                        phase_off = 2.0 * np.pi * (sf * (x_off * cos_th + y_off * sin_th) - tf * t_s)
+                        g_on = np.sin(phase_on)
+                        g_off = np.sin(phase_off)
+                        lgn_on = np.clip(g_on, 0.0, None) * mask_on
+                        lgn_off = np.clip(-g_off, 0.0, None) * mask_off
+                        score += float(np.dot(bias_on, lgn_on) + np.dot(bias_off, lgn_off))
+                    match_scores.append(score / n_mf_phases)
+
+                # Pass 2: scale all biases to median matched-filter score
+                target_score = float(np.median(match_scores))
+                for m in range(self.M):
+                    bias_on, bias_off = biases[m]
+                    if abs(match_scores[m]) > 1e-12:
+                        scale = target_score / match_scores[m]
+                        W[m, :N2] += (bias_on * scale).astype(np.float32)
+                        W[m, N2:] += (bias_off * scale).astype(np.float32)
+                    else:
+                        W[m, :N2] += bias_on.astype(np.float32)
+                        W[m, N2:] += bias_off.astype(np.float32)
         else:
             raise ValueError("init_mode must be 'random', 'near_uniform', or 'seeded'")
 
         self.W = np.clip(W, 0.0, p.w_max)
 
         # Structural retinotopic caps for thalamocortical weights.
-        self.lgn_mask_e = np.tile(self._lgn_mask_e_vec[None, :], (p.M, 1)).astype(np.float32)
-        self.lgn_mask_pv = np.tile(self._lgn_mask_pv_vec[None, :], (self.n_pv, 1)).astype(np.float32)
+        if self.n_hc > 1:
+            # Block-diagonal lgn_mask_e: each neuron only connects to its own HC's LGN pixels.
+            n_pix = self.n_lgn // 2
+            sigma_e = float(p.lgn_sigma_e) if p.lgn_sigma_e > 0 else 0.0
+            sigma_pv = float(p.lgn_sigma_pv) if p.lgn_sigma_pv > 0 else 0.0
 
-        def sample_tc_mask(n_post: int, frac: float, mask_vec: np.ndarray, seed_tag: int) -> np.ndarray:
+            self.lgn_mask_e = np.zeros((self.M, self.n_lgn), dtype=np.float32)
+            self.lgn_mask_pv = np.zeros((self.n_pv, self.n_lgn), dtype=np.float32)
+
+            for hc in range(self.n_hc):
+                m_slice = slice(hc * self.M_per_hc, (hc + 1) * self.M_per_hc)
+                on_slice = slice(hc * self.n_pix_per_hc, (hc + 1) * self.n_pix_per_hc)
+                off_slice = slice(n_pix + hc * self.n_pix_per_hc, n_pix + (hc + 1) * self.n_pix_per_hc)
+
+                if sigma_e > 0:
+                    hc_env_on = np.exp(-d2_on / (2.0 * sigma_e * sigma_e)).astype(np.float32).ravel()
+                    hc_env_off = np.exp(-d2_off / (2.0 * sigma_e * sigma_e)).astype(np.float32).ravel()
+                    max_val = max(float(hc_env_on.max()), float(hc_env_off.max()), 1e-12)
+                    hc_env_on /= max_val
+                    hc_env_off /= max_val
+                else:
+                    hc_env_on = np.ones(self.n_pix_per_hc, dtype=np.float32)
+                    hc_env_off = np.ones(self.n_pix_per_hc, dtype=np.float32)
+
+                for m in range(self.M_per_hc):
+                    self.lgn_mask_e[hc * self.M_per_hc + m, on_slice] = hc_env_on
+                    self.lgn_mask_e[hc * self.M_per_hc + m, off_slice] = hc_env_off
+
+                if sigma_pv > 0:
+                    hc_env_pv_on = np.exp(-d2_on / (2.0 * sigma_pv * sigma_pv)).astype(np.float32).ravel()
+                    hc_env_pv_off = np.exp(-d2_off / (2.0 * sigma_pv * sigma_pv)).astype(np.float32).ravel()
+                    max_val = max(float(hc_env_pv_on.max()), float(hc_env_pv_off.max()), 1e-12)
+                    hc_env_pv_on /= max_val
+                    hc_env_pv_off /= max_val
+                else:
+                    hc_env_pv_on = np.ones(self.n_pix_per_hc, dtype=np.float32)
+                    hc_env_pv_off = np.ones(self.n_pix_per_hc, dtype=np.float32)
+
+                pv_start = hc * self.M_per_hc * p.n_pv_per_ensemble
+                for m in range(self.M_per_hc):
+                    for pv_k in range(p.n_pv_per_ensemble):
+                        pv_idx = pv_start + m * p.n_pv_per_ensemble + pv_k
+                        self.lgn_mask_pv[pv_idx, on_slice] = hc_env_pv_on
+                        self.lgn_mask_pv[pv_idx, off_slice] = hc_env_pv_off
+        else:
+            self.lgn_mask_e = np.tile(self._lgn_mask_e_vec[None, :], (self.M, 1)).astype(np.float32)
+            self.lgn_mask_pv = np.tile(self._lgn_mask_pv_vec[None, :], (self.n_pv, 1)).astype(np.float32)
+
+        def sample_tc_mask(n_post: int, frac: float, mask_vec: np.ndarray, seed_tag: int,
+                           hc_assignment: np.ndarray | None = None) -> np.ndarray:
+            """Sample thalamocortical structural sparsity masks.
+
+            For multi-HC, each neuron samples only from its own HC's ON/OFF indices.
+            """
             frac = float(frac)
             if not (0.0 < frac <= 1.0):
                 raise ValueError("tc_conn_fraction_* must be in (0, 1]")
@@ -1567,38 +1772,84 @@ class RgcLgnV1Network:
                 return np.ones((n_post, self.n_lgn), dtype=bool)
             tc_rng = np.random.default_rng(np.random.SeedSequence([p.seed, 54321, seed_tag]))
             mask = np.zeros((n_post, self.n_lgn), dtype=bool)
-            n_keep = int(round(frac * float(self.n_lgn)))
-            n_keep = int(max(1, min(self.n_lgn, n_keep)))
-            n_pix = p.N * p.N
-            if p.tc_conn_balance_onoff:
-                n_on = int(min(n_pix, n_keep // 2))
-                n_off = int(min(n_pix, n_keep - n_on))
-                prob_pix = mask_vec[:n_pix].astype(np.float64, copy=True)
-                prob_pix /= float(prob_pix.sum() + 1e-12)
+
+            if self.n_hc > 1 and hc_assignment is not None:
+                # Multi-HC: sample per-HC
+                n_pix_total = self.n_lgn // 2
+                n_keep_per_hc = int(round(frac * float(self.n_lgn_per_hc)))
+                n_keep_per_hc = int(max(1, min(self.n_lgn_per_hc, n_keep_per_hc)))
                 for i in range(n_post):
-                    if n_on > 0:
-                        on_idx = tc_rng.choice(n_pix, size=n_on, replace=False, p=prob_pix)
-                        mask[i, on_idx] = True
-                    if n_off > 0:
-                        off_idx = tc_rng.choice(n_pix, size=n_off, replace=False, p=prob_pix)
-                        mask[i, n_pix + off_idx] = True
+                    hc = int(hc_assignment[i])
+                    on_start = hc * self.n_pix_per_hc
+                    off_start = n_pix_total + hc * self.n_pix_per_hc
+                    if p.tc_conn_balance_onoff:
+                        n_on = int(min(self.n_pix_per_hc, n_keep_per_hc // 2))
+                        n_off = int(min(self.n_pix_per_hc, n_keep_per_hc - n_on))
+                        hc_on_prob = mask_vec[on_start:on_start + self.n_pix_per_hc].astype(np.float64, copy=True)
+                        hc_on_prob /= float(hc_on_prob.sum() + 1e-12)
+                        if n_on > 0:
+                            on_idx = tc_rng.choice(self.n_pix_per_hc, size=n_on, replace=False, p=hc_on_prob)
+                            mask[i, on_start + on_idx] = True
+                        hc_off_prob = mask_vec[off_start:off_start + self.n_pix_per_hc].astype(np.float64, copy=True)
+                        hc_off_prob /= float(hc_off_prob.sum() + 1e-12)
+                        if n_off > 0:
+                            off_idx = tc_rng.choice(self.n_pix_per_hc, size=n_off, replace=False, p=hc_off_prob)
+                            mask[i, off_start + off_idx] = True
+                    else:
+                        # Sample from this HC's combined ON+OFF slice
+                        hc_lgn = np.concatenate([
+                            mask_vec[on_start:on_start + self.n_pix_per_hc],
+                            mask_vec[off_start:off_start + self.n_pix_per_hc]
+                        ]).astype(np.float64, copy=True)
+                        hc_lgn /= float(hc_lgn.sum() + 1e-12)
+                        idxs = tc_rng.choice(self.n_lgn_per_hc, size=n_keep_per_hc, replace=False, p=hc_lgn)
+                        for idx in idxs:
+                            if idx < self.n_pix_per_hc:
+                                mask[i, on_start + idx] = True
+                            else:
+                                mask[i, off_start + (idx - self.n_pix_per_hc)] = True
             else:
-                prob = mask_vec.astype(np.float64, copy=True)
-                prob /= float(prob.sum() + 1e-12)
-                for i in range(n_post):
-                    idxs = tc_rng.choice(self.n_lgn, size=n_keep, replace=False, p=prob)
-                    mask[i, idxs] = True
+                # Legacy single-HC
+                n_keep = int(round(frac * float(self.n_lgn)))
+                n_keep = int(max(1, min(self.n_lgn, n_keep)))
+                n_pix_local = p.N * p.N
+                if p.tc_conn_balance_onoff:
+                    n_on = int(min(n_pix_local, n_keep // 2))
+                    n_off = int(min(n_pix_local, n_keep - n_on))
+                    prob_pix = mask_vec[:n_pix_local].astype(np.float64, copy=True)
+                    prob_pix /= float(prob_pix.sum() + 1e-12)
+                    for i in range(n_post):
+                        if n_on > 0:
+                            on_idx = tc_rng.choice(n_pix_local, size=n_on, replace=False, p=prob_pix)
+                            mask[i, on_idx] = True
+                        if n_off > 0:
+                            off_idx = tc_rng.choice(n_pix_local, size=n_off, replace=False, p=prob_pix)
+                            mask[i, n_pix_local + off_idx] = True
+                else:
+                    prob = mask_vec.astype(np.float64, copy=True)
+                    prob /= float(prob.sum() + 1e-12)
+                    for i in range(n_post):
+                        idxs = tc_rng.choice(self.n_lgn, size=n_keep, replace=False, p=prob)
+                        mask[i, idxs] = True
             return mask
 
         # Structural sparsity masks for thalamocortical connectivity (anatomical priors).
-        self.tc_mask_e = sample_tc_mask(p.M, p.tc_conn_fraction_e, self._lgn_mask_e_vec, seed_tag=1)
-        self.tc_mask_pv = sample_tc_mask(self.n_pv, p.tc_conn_fraction_pv, self._lgn_mask_pv_vec, seed_tag=2)
+        # For multi-HC, each E neuron samples from its own HC. PV inherits parent E's HC.
+        e_hc_assignment = self.hc_id if self.n_hc > 1 else None
+        pv_hc_assignment = None
+        if self.n_hc > 1:
+            pv_parent = (np.arange(self.n_pv, dtype=np.int32) // max(1, int(p.n_pv_per_ensemble))).astype(np.int32)
+            pv_hc_assignment = self.hc_id[pv_parent]
+        self.tc_mask_e = sample_tc_mask(self.M, p.tc_conn_fraction_e, self._lgn_mask_e_vec, seed_tag=1,
+                                        hc_assignment=e_hc_assignment)
+        self.tc_mask_pv = sample_tc_mask(self.n_pv, p.tc_conn_fraction_pv, self._lgn_mask_pv_vec, seed_tag=2,
+                                         hc_assignment=pv_hc_assignment)
         self.tc_mask_e_f32 = self.tc_mask_e.astype(np.float32)
         self.tc_mask_pv_f32 = self.tc_mask_pv.astype(np.float32)
         np.minimum(self.W, p.w_max * self.lgn_mask_e, out=self.W)
         self.W *= self.tc_mask_e_f32
 
-        n_pix = p.N * p.N
+        n_pix = self.n_lgn // 2
         # Targets for ON/OFF "split constraint" scaling (local per-neuron resource pools).
         self.split_target_on = self.W[:, :n_pix].sum(axis=1).astype(np.float32)
         self.split_target_off = self.W[:, n_pix:].sum(axis=1).astype(np.float32)
@@ -1609,11 +1860,23 @@ class RgcLgnV1Network:
 
         # Nearest-neighbor ON↔OFF matching based on mosaic coordinates.
         # Used by developmental ON/OFF competition and by E-E STDP.
-        on_pos = np.stack([self.X_on.ravel(), self.Y_on.ravel()], axis=1).astype(np.float32, copy=False)
-        off_pos = np.stack([self.X_off.ravel(), self.Y_off.ravel()], axis=1).astype(np.float32, copy=False)
-        d2_onoff = np.square(on_pos[:, None, :] - off_pos[None, :, :]).sum(axis=2)
-        self.on_to_off = np.argmin(d2_onoff, axis=1).astype(np.int32, copy=False)
-        self.off_to_on = np.argmin(d2_onoff, axis=0).astype(np.int32, copy=False)
+        if self.n_hc > 1:
+            all_on_to_off = []
+            all_off_to_on = []
+            for hc in range(self.n_hc):
+                on_pos = np.stack([self.X_on_hcs[hc].ravel(), self.Y_on_hcs[hc].ravel()], axis=1)
+                off_pos = np.stack([self.X_off_hcs[hc].ravel(), self.Y_off_hcs[hc].ravel()], axis=1)
+                d2 = np.square(on_pos[:, None, :] - off_pos[None, :, :]).sum(axis=2)
+                all_on_to_off.append(np.argmin(d2, axis=1) + hc * self.n_pix_per_hc)
+                all_off_to_on.append(np.argmin(d2, axis=0) + hc * self.n_pix_per_hc)
+            self.on_to_off = np.concatenate(all_on_to_off).astype(np.int32)
+            self.off_to_on = np.concatenate(all_off_to_on).astype(np.int32)
+        else:
+            on_pos = np.stack([self.X_on.ravel(), self.Y_on.ravel()], axis=1).astype(np.float32, copy=False)
+            off_pos = np.stack([self.X_off.ravel(), self.Y_off.ravel()], axis=1).astype(np.float32, copy=False)
+            d2_onoff = np.square(on_pos[:, None, :] - off_pos[None, :, :]).sum(axis=2)
+            self.on_to_off = np.argmin(d2_onoff, axis=1).astype(np.int32, copy=False)
+            self.off_to_on = np.argmin(d2_onoff, axis=0).astype(np.int32, copy=False)
 
         # --- LGN->PV feedforward weights (thalamocortical drive to FS interneurons) ---
         # PV thalamic drive is initialized broad/dense (can be weakly tuned via learning elsewhere).
@@ -1634,8 +1897,8 @@ class RgcLgnV1Network:
 
         # E->PV connectivity (local-to-nearby by default; sigma=0 recovers legacy private wiring).
         if float(p.pv_in_sigma) <= 0.0:
-            self.W_e_pv = np.zeros((self.n_pv, p.M), dtype=np.float32)
-            for m in range(p.M):
+            self.W_e_pv = np.zeros((self.n_pv, self.M), dtype=np.float32)
+            for m in range(self.M):
                 pv_start = m * p.n_pv_per_ensemble
                 pv_end = pv_start + p.n_pv_per_ensemble
                 self.W_e_pv[pv_start:pv_end, m] = p.w_e_pv
@@ -1648,8 +1911,8 @@ class RgcLgnV1Network:
 
         # PV->E connectivity (local-to-nearby by default; sigma=0 recovers legacy private wiring).
         if float(p.pv_out_sigma) <= 0.0:
-            self.W_pv_e = np.zeros((p.M, self.n_pv), dtype=np.float32)
-            for m in range(p.M):
+            self.W_pv_e = np.zeros((self.M, self.n_pv), dtype=np.float32)
+            for m in range(self.M):
                 pv_start = m * p.n_pv_per_ensemble
                 pv_end = pv_start + p.n_pv_per_ensemble
                 self.W_pv_e[m, pv_start:pv_end] = p.w_pv_e
@@ -1675,22 +1938,22 @@ class RgcLgnV1Network:
 
         # E->SOM connectivity (can be long-range): E activity recruits SOM near the target site,
         # producing disynaptic long-range suppression without literal long-range inhibitory axons.
-        self.W_e_som = np.zeros((self.n_som, p.M), dtype=np.float32)
+        self.W_e_som = np.zeros((self.n_som, self.M), dtype=np.float32)
         for som_idx in range(self.n_som):
             m = som_idx // p.n_som_per_ensemble
-            kernel = np.zeros(p.M, dtype=np.float32)
-            for pre in range(p.M):
+            kernel = np.zeros(self.M, dtype=np.float32)
+            for pre in range(self.M):
                 d2 = float(self.cortex_dist2[pre, m])
                 kernel[pre] = math.exp(-d2 / (2.0 * (p.som_in_sigma ** 2)))
             kernel /= float(kernel.sum() + 1e-12)
             self.W_e_som[som_idx, :] = p.w_e_som * kernel
 
         # SOM->E connectivity (local): SOM inhibits nearby excitatory neurons.
-        self.W_som_e = np.zeros((p.M, self.n_som), dtype=np.float32)
+        self.W_som_e = np.zeros((self.M, self.n_som), dtype=np.float32)
         for som_idx in range(self.n_som):
             m = som_idx // p.n_som_per_ensemble
-            kernel = np.zeros(p.M, dtype=np.float32)
-            for post in range(p.M):
+            kernel = np.zeros(self.M, dtype=np.float32)
+            for post in range(self.M):
                 d2 = float(self.cortex_dist2[post, m])
                 kernel[post] = math.exp(-d2 / (2.0 * (p.som_out_sigma ** 2)))
             if not p.som_self_inhibit:
@@ -1698,11 +1961,30 @@ class RgcLgnV1Network:
             kernel /= float(kernel.sum() + 1e-12)
             self.W_som_e[:, som_idx] = p.w_som_e * kernel
 
+        # Inter-HC SOM override: set inter-HC E→SOM and SOM→E weights explicitly.
+        if self.n_hc > 1:
+            for som_idx in range(self.n_som):
+                m = som_idx // p.n_som_per_ensemble
+                hc_m = self.hc_id[m]
+                for pre in range(self.M):
+                    if self.hc_id[pre] != hc_m:
+                        d2 = float(self.cortex_dist2[pre, m])
+                        self.W_e_som[som_idx, pre] = p.inter_hc_som_w_e_som * math.exp(
+                            -d2 / (2.0 * (p.som_in_sigma ** 2)))
+            for som_idx in range(self.n_som):
+                m = som_idx // p.n_som_per_ensemble
+                hc_m = self.hc_id[m]
+                for post in range(self.M):
+                    if self.hc_id[post] != hc_m:
+                        d2 = float(self.cortex_dist2[post, m])
+                        self.W_som_e[post, som_idx] = p.inter_hc_som_w_som_e * math.exp(
+                            -d2 / (2.0 * (p.som_out_sigma ** 2)))
+
         # VIP connectivity (local disinhibition): E -> VIP -> SOM.
-        self.W_e_vip = np.zeros((self.n_vip, p.M), dtype=np.float32)
+        self.W_e_vip = np.zeros((self.n_vip, self.M), dtype=np.float32)
         self.W_vip_som = np.zeros((self.n_som, self.n_vip), dtype=np.float32)
         if self.n_vip > 0:
-            for m in range(p.M):
+            for m in range(self.M):
                 vip_start = m * p.n_vip_per_ensemble
                 vip_end = vip_start + p.n_vip_per_ensemble
                 self.W_e_vip[vip_start:vip_end, m] = p.w_e_vip
@@ -1714,10 +1996,10 @@ class RgcLgnV1Network:
                     )
 
         # --- Lateral excitatory connectivity ---
-        self.W_e_e = np.zeros((p.M, p.M), dtype=np.float32)
+        self.W_e_e = np.zeros((self.M, self.M), dtype=np.float32)
         if p.ee_connectivity == "gaussian":
-            for i in range(p.M):
-                for j in range(p.M):
+            for i in range(self.M):
+                for j in range(self.M):
                     if i != j:
                         d2 = float(self.cortex_dist2[i, j])
                         self.W_e_e[i, j] = p.w_e_e_lateral * math.exp(-d2 / (2.0 * p.lateral_sigma**2))
@@ -1725,8 +2007,8 @@ class RgcLgnV1Network:
             self.W_e_e[:] = float(p.w_e_e_baseline)
             np.fill_diagonal(self.W_e_e, 0.0)
         elif p.ee_connectivity == "gaussian_plus_baseline":
-            for i in range(p.M):
-                for j in range(p.M):
+            for i in range(self.M):
+                for j in range(self.M):
                     if i != j:
                         d2 = float(self.cortex_dist2[i, j])
                         self.W_e_e[i, j] = (
@@ -1735,43 +2017,81 @@ class RgcLgnV1Network:
                         )
         else:
             raise ValueError(f"Unknown ee_connectivity: {p.ee_connectivity!r}")
+
+        # Inter-HC E→E override: set explicit inter-HC horizontal connection weights.
+        if self.n_hc > 1 and p.inter_hc_w_e_e > 0:
+            for i in range(self.M):
+                for j in range(self.M):
+                    if self.hc_id[i] != self.hc_id[j]:
+                        d2 = float(self.cortex_dist2[i, j])
+                        self.W_e_e[i, j] = p.inter_hc_w_e_e * math.exp(-d2 / (2.0 * p.lateral_sigma**2))
+
         # Allow plasticity on all off-diagonal connections (structural plasticity can grow weights from 0).
-        self.mask_e_e = np.ones((p.M, p.M), dtype=bool)
+        self.mask_e_e = np.ones((self.M, self.M), dtype=bool)
         np.fill_diagonal(self.mask_e_e, False)
 
         # --- E→E heterogeneous conduction delays ---
         # Delay buffer for E→E transmission: ring buffer of V1 E spikes.
+        if self.n_hc > 1:
+            # For multi-HC, extend delay range to accommodate inter-HC conduction delays.
+            inter_hc_max_ms = p.inter_hc_delay_base_ms + p.inter_hc_delay_range_ms
+            effective_max_ms = max(p.ee_delay_ms_max, inter_hc_max_ms)
+        else:
+            effective_max_ms = p.ee_delay_ms_max
         delay_min_steps = max(1, int(round(p.ee_delay_ms_min / p.dt_ms)))
-        delay_max_steps = max(delay_min_steps, int(round(p.ee_delay_ms_max / p.dt_ms)))
+        delay_max_steps = max(delay_min_steps, int(round(effective_max_ms / p.dt_ms)))
         self.L_ee = delay_max_steps + 1  # buffer length
-        self.delay_buf_ee = np.zeros((self.L_ee, p.M), dtype=np.uint8)
+        self.delay_buf_ee = np.zeros((self.L_ee, self.M), dtype=np.uint8)
         self.ptr_ee = 0
 
         # Build D_ee (M×M) delay matrix in timesteps.
         # Distance-dependent component: scale cortical distance to delay range.
         max_dist = float(np.sqrt(self.cortex_dist2.max())) if self.cortex_dist2.max() > 0 else 1.0
         dist_norm = np.sqrt(self.cortex_dist2) / max_dist  # [0, 1]
-        delay_range = delay_max_steps - delay_min_steps
+        intra_delay_max_steps = max(delay_min_steps, int(round(p.ee_delay_ms_max / p.dt_ms)))
+        delay_range = intra_delay_max_steps - delay_min_steps
         dist_frac = float(np.clip(p.ee_delay_distance_scale, 0.0, 1.0))
         D_ee_base = delay_min_steps + dist_frac * delay_range * dist_norm
         # Add Gaussian jitter (dedicated RNG stream to avoid perturbing subsequent draws)
         rng_delay = np.random.default_rng(p.seed + 7919)
         jitter_steps = p.ee_delay_jitter_ms / p.dt_ms
         if jitter_steps > 0:
-            D_ee_base = D_ee_base + rng_delay.normal(0.0, jitter_steps, size=(p.M, p.M))
+            D_ee_base = D_ee_base + rng_delay.normal(0.0, jitter_steps, size=(self.M, self.M))
         self.D_ee = np.clip(np.round(D_ee_base), delay_min_steps, delay_max_steps).astype(np.int16)
         np.fill_diagonal(self.D_ee, 0)  # no self-connections
+
+        # For multi-HC, override inter-HC delays with distance-dependent conduction delays.
+        if self.n_hc > 1:
+            # Compute HC-center distances for scaling delays.
+            hc_side = math.isqrt(self.M_per_hc)
+            for i in range(self.M):
+                for j in range(self.M):
+                    if i != j and self.hc_id[i] != self.hc_id[j]:
+                        # HC-level distance: adjacent=1, diagonal=sqrt(2)
+                        hc_i = int(self.hc_id[i])
+                        hc_j = int(self.hc_id[j])
+                        hc_ix, hc_iy = hc_i % self.hc_grid_w, hc_i // self.hc_grid_w
+                        hc_jx, hc_jy = hc_j % self.hc_grid_w, hc_j // self.hc_grid_w
+                        hc_dist = math.sqrt((hc_ix - hc_jx)**2 + (hc_iy - hc_jy)**2)
+                        # Scale: adjacent(1)=base, diagonal(sqrt(2))=base+range
+                        max_hc_dist = math.sqrt((self.hc_grid_w - 1)**2 + (self.hc_grid_h - 1)**2) if (self.hc_grid_w > 1 or self.hc_grid_h > 1) else 1.0
+                        frac = (hc_dist - 1.0) / max(1e-6, max_hc_dist - 1.0) if max_hc_dist > 1.0 else 0.0
+                        frac = max(0.0, min(1.0, frac))
+                        delay_ms = p.inter_hc_delay_base_ms + frac * p.inter_hc_delay_range_ms
+                        delay_steps = max(delay_min_steps, int(round(delay_ms / p.dt_ms)))
+                        delay_steps = min(delay_steps, delay_max_steps)
+                        self.D_ee[i, j] = delay_steps
 
         # --- Laminar (L4 -> L2/3) connectivity (optional) ---
         # Implemented as a fixed Gaussian kernel on the same cortical geometry used for lateral E->E.
         self.W_l4_l23 = None
         if p.laminar_enabled:
-            self.W_l4_l23 = np.zeros((p.M, p.M), dtype=np.float32)
+            self.W_l4_l23 = np.zeros((self.M, self.M), dtype=np.float32)
             sig = float(p.l4_l23_sigma)
             if sig <= 0.0:
                 np.fill_diagonal(self.W_l4_l23, float(p.w_l4_l23))
             else:
-                for post in range(p.M):
+                for post in range(self.M):
                     kernel = np.exp(-self.cortex_dist2[:, post] / (2.0 * sig * sig)).astype(np.float32)
                     kernel /= float(kernel.sum() + 1e-12)
                     self.W_l4_l23[post, :] = float(p.w_l4_l23) * kernel
@@ -1779,16 +2099,16 @@ class RgcLgnV1Network:
         # --- Plasticity mechanisms ---
         self.stdp = TripletSTDP(
             self.n_lgn,
-            p.M,
+            self.M,
             p,
             self.rng,
             split_on_to_off=self.on_to_off,
             split_off_to_on=self.off_to_on,
         )
-        self.homeostasis = HomeostaticScaling(p.M, p)
-        self.pv_istdp = PVInhibitoryPlasticity(p.M, self.n_pv, p)
-        self.ee_stdp = LateralEESynapticPlasticity(p.M, p)
-        self.delay_ee_stdp = DelayAwareEESTDP(p.M, p)
+        self.homeostasis = HomeostaticScaling(self.M, p)
+        self.pv_istdp = PVInhibitoryPlasticity(self.M, self.n_pv, p)
+        self.ee_stdp = LateralEESynapticPlasticity(self.M, p)
+        self.delay_ee_stdp = DelayAwareEESTDP(self.M, p)
         # Two-phase training flags
         self.ff_plastic_enabled = True     # feedforward STDP active
         self.ee_stdp_active = False        # delay-aware E→E STDP active
@@ -1970,13 +2290,60 @@ class RgcLgnV1Network:
         self._rgc_dog_grating_gain: float = float(gains.mean())
 
     def _build_rgc_lgn_pool_matrix(self) -> np.ndarray:
-        """Build retinogeniculate pooling matrix (same-sign center + opponent surround)."""
+        """Build retinogeniculate pooling matrix (same-sign center + opponent surround).
+
+        For multi-HC, builds a block-diagonal matrix: each HC's LGN pools from its own retinal patch only.
+        """
         p = self.p
-        n_pix = int(p.N) * int(p.N)
-        n_lgn = 2 * n_pix
+        n_pix_per_hc = int(p.N) * int(p.N)
 
         if not p.lgn_pooling:
-            return np.eye(n_lgn, dtype=np.float32)
+            return np.eye(self.n_lgn, dtype=np.float32)
+
+        if self.n_hc > 1:
+            # Block-diagonal: each HC independently pools from its own ON/OFF mosaic.
+            n_pix_total = self.n_lgn // 2
+            mat = np.zeros((self.n_lgn, self.n_lgn), dtype=np.float32)
+            sig_c = max(1e-6, float(p.lgn_pool_sigma_center))
+            sig_s = max(1e-6, float(p.lgn_pool_sigma_surround))
+            w_same = float(p.lgn_pool_same_gain)
+            w_opp = float(p.lgn_pool_opponent_gain)
+
+            for hc in range(self.n_hc):
+                on_start = hc * n_pix_per_hc
+                on_end = on_start + n_pix_per_hc
+                off_start = n_pix_total + hc * n_pix_per_hc
+                off_end = off_start + n_pix_per_hc
+
+                X_on = self.X_on_hcs[hc].astype(np.float32).ravel()
+                Y_on = self.Y_on_hcs[hc].astype(np.float32).ravel()
+                X_off = self.X_off_hcs[hc].astype(np.float32).ravel()
+                Y_off = self.Y_off_hcs[hc].astype(np.float32).ravel()
+
+                d2_on = ((X_on[:, None] - X_on[None, :])**2 + (Y_on[:, None] - Y_on[None, :])**2).astype(np.float32)
+                d2_off = ((X_off[:, None] - X_off[None, :])**2 + (Y_off[:, None] - Y_off[None, :])**2).astype(np.float32)
+                d2_onoff = ((X_on[:, None] - X_off[None, :])**2 + (Y_on[:, None] - Y_off[None, :])**2).astype(np.float32)
+                d2_offon = ((X_off[:, None] - X_on[None, :])**2 + (Y_off[:, None] - Y_on[None, :])**2).astype(np.float32)
+
+                same_on = np.exp(-d2_on / (2.0 * sig_c * sig_c)).astype(np.float32)
+                same_off = np.exp(-d2_off / (2.0 * sig_c * sig_c)).astype(np.float32)
+                opp_onoff = np.exp(-d2_onoff / (2.0 * sig_s * sig_s)).astype(np.float32)
+                opp_offon = np.exp(-d2_offon / (2.0 * sig_s * sig_s)).astype(np.float32)
+
+                same_on /= (same_on.sum(axis=1, keepdims=True) + 1e-12)
+                same_off /= (same_off.sum(axis=1, keepdims=True) + 1e-12)
+                opp_onoff /= (opp_onoff.sum(axis=1, keepdims=True) + 1e-12)
+                opp_offon /= (opp_offon.sum(axis=1, keepdims=True) + 1e-12)
+
+                mat[on_start:on_end, on_start:on_end] = w_same * same_on
+                mat[on_start:on_end, off_start:off_end] = -w_opp * opp_onoff
+                mat[off_start:off_end, off_start:off_end] = w_same * same_off
+                mat[off_start:off_end, on_start:on_end] = -w_opp * opp_offon
+            return mat
+
+        # Legacy single-HC path
+        n_pix = n_pix_per_hc
+        n_lgn = 2 * n_pix
 
         X_on = self.X_on.astype(np.float32).ravel()
         Y_on = self.Y_on.astype(np.float32).ravel()
@@ -2205,6 +2572,47 @@ class RgcLgnV1Network:
         """Backwards-compatible single drive accessor (returns ON drive)."""
         drive_on, _ = self.rgc_drives_grating(theta_deg, t_ms, phase, contrast=contrast)
         return drive_on
+
+    def rgc_drives_grating_multi_hc(self, theta_deg: float, t_ms: float, phase: float, *,
+                                     contrast: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate multi-HC grating drives in flat [ALL_ON | ALL_OFF] layout.
+
+        Returns flat (n_pix_total,) ON and OFF drive vectors.
+        """
+        p = self.p
+        on_parts = []
+        off_parts = []
+
+        # Use the same DoG gain for all HCs (gratings are eigenfunctions of the linear DoG filter).
+        if p.rgc_center_surround and str(p.rgc_dog_impl).lower() == "padded_fft":
+            g = self._rgc_dog_grating_gain * contrast
+        else:
+            g = contrast
+
+        for hc in range(self.n_hc):
+            drive_on_hc = (g * self.grating_on_coords(
+                theta_deg, t_ms, phase,
+                self.X_on_hcs[hc], self.Y_on_hcs[hc])).astype(np.float32)
+            drive_off_hc = (g * self.grating_on_coords(
+                theta_deg, t_ms, phase,
+                self.X_off_hcs[hc], self.Y_off_hcs[hc])).astype(np.float32)
+            on_parts.append(drive_on_hc.ravel())
+            off_parts.append(drive_off_hc.ravel())
+        return np.concatenate(on_parts), np.concatenate(off_parts)
+
+    def rgc_spikes_from_drives_flat(self, drive_on: np.ndarray, drive_off: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate ON and OFF RGC spikes from flat (n_pix_total,) drive vectors.
+
+        Used for multi-HC mode where drives are already flat concatenated vectors.
+        No temporal filtering or refractory support (those are for single-HC only).
+        """
+        p = self.p
+        on_rate = p.base_rate + p.gain_rate * np.clip(drive_on, 0, None)
+        off_rate = p.base_rate + p.gain_rate * np.clip(-drive_off, 0, None)
+        dt_s = p.dt_ms / 1000.0
+        on_spk = (self.rng.random(drive_on.shape) < (on_rate * dt_s)).astype(np.uint8)
+        off_spk = (self.rng.random(drive_off.shape) < (off_rate * dt_s)).astype(np.uint8)
+        return on_spk, off_spk
 
     def rgc_spikes_from_drives(self, drive_on: np.ndarray, drive_off: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Generate ON and OFF RGC spikes from separate (ON,OFF) drive fields."""
@@ -2702,7 +3110,7 @@ class RgcLgnV1Network:
         p = self.p
         if p.split_constraint_rate <= 0.0:
             return
-        n_pix = int(p.N) * int(p.N)
+        n_pix = self.n_lgn // 2  # total ON (or OFF) pixels across all HCs
 
         sum_on = self.W[:, :n_pix].sum(axis=1).astype(np.float32, copy=False)
         sum_off = self.W[:, n_pix:].sum(axis=1).astype(np.float32, copy=False)
@@ -2748,7 +3156,13 @@ class RgcLgnV1Network:
         v1_counts = np.zeros(self.M, dtype=np.int32)
 
         for k in range(steps):
-            on_spk, off_spk = self.rgc_spikes_grating(theta_deg, t_ms=k * p.dt_ms, phase=phase, contrast=contrast)
+            if self.n_hc > 1:
+                drive_on, drive_off = self.rgc_drives_grating_multi_hc(
+                    theta_deg, t_ms=k * p.dt_ms, phase=phase, contrast=contrast)
+                on_spk, off_spk = self.rgc_spikes_from_drives_flat(drive_on, drive_off)
+            else:
+                on_spk, off_spk = self.rgc_spikes_grating(
+                    theta_deg, t_ms=k * p.dt_ms, phase=phase, contrast=contrast)
             v1_counts += self.step(on_spk, off_spk, plastic=plastic)
 
         # Slow processes updated at segment boundaries
@@ -3236,6 +3650,28 @@ class RgcLgnV1Network:
         self.restore_dynamic_state(snap)
 
         return rates
+
+    def evaluate_tuning_per_hc(self, thetas_deg: np.ndarray, repeats: int, *,
+                                contrast: float = 1.0) -> dict:
+        """Evaluate orientation tuning per hypercolumn.
+
+        Returns a dict with keys 'hc0', 'hc1', ... each containing:
+            'mean_osi': float, 'osi': ndarray(M_per_hc,), 'rates': ndarray(M_per_hc, K)
+        """
+        rates = self.evaluate_tuning(thetas_deg, repeats, contrast=contrast)
+        results = {}
+        for hc in range(self.n_hc):
+            m_start = hc * self.M_per_hc
+            m_end = m_start + self.M_per_hc
+            hc_rates = rates[m_start:m_end]
+            osi_vals = np.array([compute_osi(hc_rates[m:m+1], thetas_deg)[0][0]
+                                 for m in range(self.M_per_hc)])
+            results[f'hc{hc}'] = {
+                'mean_osi': float(osi_vals.mean()),
+                'osi': osi_vals,
+                'rates': hc_rates,
+            }
+        return results
 
 
 # =============================================================================

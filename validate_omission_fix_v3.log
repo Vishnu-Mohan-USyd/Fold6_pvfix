@@ -1,0 +1,149 @@
+/home/vysoforlife/miniconda3/envs/habitat/lib/python3.9/site-packages/scipy/__init__.py:146: UserWarning: A NumPy version >=1.17.3 and <1.25.0 is required for this version of SciPy (detected version 1.26.4
+  warnings.warn(f"A NumPy version >={np_minversion} and <{np_maxversion}"
+======================================================================
+Phase B Omission Fix Validation
+Protocol: Gavornik & Bear (2014) — 150ms elements, 800 presentations
+======================================================================
+
+======================================================================
+Test 1: g_exc_ee trace recording
+======================================================================
+  Trace shape: (4, 300, 16)
+  Expected:    (4, 300, 16)
+  Mean g_exc_ee: 0.000002
+    Element 0 (theta=0.0°): mean g_exc_ee = 0.000002
+    Element 1 (theta=45.0°): mean g_exc_ee = 0.000002
+    Element 2 (theta=90.0°): mean g_exc_ee = 0.000000
+    Element 3 (theta=135.0°): mean g_exc_ee = 0.000003
+
+  Omission trial: stim elements mean=0.000002, omitted element mean=0.000000
+
+  Test 1 PASSED: g_exc_ee trace recording works correctly
+
+======================================================================
+Test 4: Biological plausibility audit
+======================================================================
+  [OK] E→E STDP is pair-based with weight dependence
+  [OK] Phase B uses only E→E STDP (no feedforward)
+  [OK] Control condition uses novel orientation (22.5°)
+  [OK] No global E→E weight renormalization
+  [OK] Omission response averages over multiple evaluation trials
+
+  Test 4 PASSED: No non-biological hacks detected
+
+======================================================================
+Test 5: Performance benchmark
+======================================================================
+  Warming up JIT...
+  Timing 100 presentations (150ms elements, 1.5s ITI)...
+    100 presentations: 17.09s (170.9ms/trial)
+    Estimated 800 presentations: 136.7s (2.3min)
+
+  Test 5 PASSED: Estimated 136.7s for 800 presentations
+
+======================================================================
+Test 2: F>R ratio (800 presentations, 150ms elements)
+======================================================================
+
+  Phase A (100 segments, JAX, seed=42)...
+    Phase A: 50/100 segments done
+    Phase A: 100/100 segments done
+    Mean OSI after Phase A: 0.809
+  Calibrating E→E drive (JAX)...
+  [calibrate_jax] scale=1 → drive_frac=0.0001
+  [calibrate_jax] scale=5 → drive_frac=0.0005
+  [calibrate_jax] scale=20 → drive_frac=0.0019
+  [calibrate_jax] scale=50 → drive_frac=0.0048
+  [calibrate_jax] scale=100 → drive_frac=0.0096
+  [calibrate_jax] scale=200 → drive_frac=0.0191
+  [calibrate_jax] scale=500 → drive_frac=0.0499
+  [calibrate_jax] scale=1000 → drive_frac=0.1586
+  [calibrate_jax] scale=2000 → drive_frac=0.7173
+  [calibrate_jax] refine scale=707.1 → drive_frac=0.0888
+  [calibrate_jax] refine scale=840.9 → drive_frac=0.1148
+  [calibrate_jax] refine scale=917.0 → drive_frac=0.1239
+  [calibrate_jax] refine scale=957.6 → drive_frac=0.1315
+  [calibrate_jax] WARNING: OSI=0.217 < floor=0.30 at scale=1000.0
+  [calibrate_jax] back-off scale=957.6 → OSI=0.195, drive_frac=0.1315
+  [calibrate_jax] back-off scale=917.0 → OSI=0.203, drive_frac=0.1239
+  [calibrate_jax] back-off scale=840.9 → OSI=0.300, drive_frac=0.1148
+  [calibrate_jax] Final: scale=840.9 → drive_frac=0.1148, OSI=0.300
+    Calibration: scale=840.9, frac=0.1148
+    w_e_e_max=3.3636 (3× cal mean=1.6818)
+
+  [pres 0] F>R=1.0000 (fwd=1.681793, rev=1.681793)
+
+  Phase B training (800 presentations, element_ms=150.0, iti_ms=1500.0)...
+    [pres 100] F>R=1.0265 (fwd=1.620468, rev=1.578644), W_ee mean=1.60238 max=1.9591, elapsed=17.4s
+    [pres 200] F>R=1.0576 (fwd=1.581374, rev=1.495246), W_ee mean=1.54134 max=2.1306, elapsed=34.4s
+    [pres 400] F>R=1.1254 (fwd=1.562357, rev=1.388313), W_ee mean=1.47926 max=2.5192, elapsed=67.9s
+    [pres 600] F>R=1.1817 (fwd=1.528908, rev=1.293782), W_ee mean=1.42193 max=2.7638, elapsed=101.8s
+    [pres 800] F>R=1.2265 (fwd=1.524644, rev=1.243132), W_ee mean=1.39559 max=2.9266, elapsed=136.3s
+
+  Training completed in 136.3s
+  F>R trajectory: 1.000 → 1.026 → 1.058 → 1.125 → 1.182 → 1.226
+
+  Test 2: EXCEPTION — F>R must exceed 1.5 after 800 presentations, got 1.2265
+Traceback (most recent call last):
+  File "/home/vysoforlife/code_files/und_OSI_formation_extend/Fold6_pvfix/validate_omission_fix.py", line 585, in main
+    result = test_fr_ratio()
+  File "/home/vysoforlife/code_files/und_OSI_formation_extend/Fold6_pvfix/validate_omission_fix.py", line 328, in test_fr_ratio
+    assert final_ratio > 1.5, \
+AssertionError: F>R must exceed 1.5 after 800 presentations, got 1.2265
+
+======================================================================
+Test 3: Omission response (conductance-based)
+======================================================================
+
+  Phase A (100 segments, JAX, seed=42)...
+    Phase A: 50/100 segments done
+    Phase A: 100/100 segments done
+    Mean OSI after Phase A: 0.809
+  Calibrating E→E drive (JAX)...
+  [calibrate_jax] scale=1 → drive_frac=0.0001
+  [calibrate_jax] scale=5 → drive_frac=0.0005
+  [calibrate_jax] scale=20 → drive_frac=0.0019
+  [calibrate_jax] scale=50 → drive_frac=0.0048
+  [calibrate_jax] scale=100 → drive_frac=0.0096
+  [calibrate_jax] scale=200 → drive_frac=0.0191
+  [calibrate_jax] scale=500 → drive_frac=0.0499
+  [calibrate_jax] scale=1000 → drive_frac=0.1586
+  [calibrate_jax] scale=2000 → drive_frac=0.7173
+  [calibrate_jax] refine scale=707.1 → drive_frac=0.0888
+  [calibrate_jax] refine scale=840.9 → drive_frac=0.1148
+  [calibrate_jax] refine scale=917.0 → drive_frac=0.1239
+  [calibrate_jax] refine scale=957.6 → drive_frac=0.1315
+  [calibrate_jax] WARNING: OSI=0.217 < floor=0.30 at scale=1000.0
+  [calibrate_jax] back-off scale=957.6 → OSI=0.195, drive_frac=0.1315
+  [calibrate_jax] back-off scale=917.0 → OSI=0.203, drive_frac=0.1239
+  [calibrate_jax] back-off scale=840.9 → OSI=0.300, drive_frac=0.1148
+  [calibrate_jax] Final: scale=840.9 → drive_frac=0.1148, OSI=0.300
+    Calibration: scale=840.9, frac=0.1148
+    w_e_e_max=3.3636 (3× cal mean=1.6818)
+
+  Phase B training (800 presentations)...
+    [pres 0] OMR conductance=0.000050, spikes=0.0
+    [pres 200] OMR conductance=0.000021, spikes=0.0
+    [pres 400] OMR conductance=-0.000007, spikes=0.0
+    [pres 800] OMR conductance=0.001894, spikes=1.0
+
+  Final omission response:
+    Conductance (trained - control): 0.001894
+    Trained g_exc_ee: 0.002445
+    Control g_exc_ee: 0.000551
+    Spike difference: 1.0
+
+  OMR trajectory: 0.0001 → 0.0000 → -0.0000 → 0.0019
+
+  Test 3 PASSED: Omission response is positive (0.001894)
+
+======================================================================
+SUMMARY
+======================================================================
+  [PASS] Test 1: Trace recording
+  [PASS] Test 4: Bio audit
+  [PASS] Test 5: Benchmark
+  [FAIL] Test 2: F>R ratio
+  [PASS] Test 3: Omission response
+
+Some tests FAILED!

@@ -1,0 +1,101 @@
+{
+  "M3_split_OFF": {
+    "condition": "M3_split_OFF",
+    "n_seeds": 3,
+    "final_mean_osi": 0.5222272330495232,
+    "final_sem_osi": 0.11252308844566472,
+    "final_osi_per_seed": [
+      0.25,
+      0.6957006493559943,
+      0.6209810497925753
+    ]
+  },
+  "M3_stdp_split_only": {
+    "condition": "M3_stdp_split_only",
+    "n_seeds": 3,
+    "final_mean_osi": 0.0625,
+    "final_sem_osi": 0.029462782549439483,
+    "final_osi_per_seed": [
+      0.0,
+      0.125,
+      0.0625
+    ]
+  },
+  "M3_constraint_only": {
+    "condition": "M3_constraint_only",
+    "n_seeds": 3,
+    "final_mean_osi": 0.35249226308342907,
+    "final_sem_osi": 0.02305628041099478,
+    "final_osi_per_seed": [
+      0.30746871888026894,
+      0.3454773582758738,
+      0.4045307120941444
+    ]
+  },
+  "M3_Asplit_0.00": {
+    "condition": "M3_Asplit_0.00",
+    "n_seeds": 3,
+    "final_mean_osi": 0.35249226308342907,
+    "final_sem_osi": 0.02305628041099478,
+    "final_osi_per_seed": [
+      0.30746871888026894,
+      0.3454773582758738,
+      0.4045307120941444
+    ]
+  },
+  "M3_Asplit_0.05": {
+    "condition": "M3_Asplit_0.05",
+    "n_seeds": 3,
+    "final_mean_osi": 0.648883674615053,
+    "final_sem_osi": 0.01429777807047879,
+    "final_osi_per_seed": [
+      0.679746558201691,
+      0.6191158848758584,
+      0.6477885807676096
+    ]
+  },
+  "M3_Asplit_0.10": {
+    "condition": "M3_Asplit_0.10",
+    "n_seeds": 3,
+    "final_mean_osi": 0.7525058501784069,
+    "final_sem_osi": 0.005917684271837056,
+    "final_osi_per_seed": [
+      0.7569176958141326,
+      0.7622576510444254,
+      0.7383422036766625
+    ]
+  },
+  "M3_Asplit_0.20": {
+    "condition": "M3_Asplit_0.20",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8462618943628284,
+    "final_sem_osi": 0.00811787116393761,
+    "final_osi_per_seed": [
+      0.8450987377530055,
+      0.829652354464433,
+      0.864034590871047
+    ]
+  },
+  "M3_Asplit_0.40": {
+    "condition": "M3_Asplit_0.40",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8572657515773789,
+    "final_sem_osi": 0.014538161196355958,
+    "final_osi_per_seed": [
+      0.8767668565284592,
+      0.8733200778776777,
+      0.8217103203259997
+    ]
+  },
+  "M3_Asplit_0.80": {
+    "condition": "M3_Asplit_0.80",
+    "n_seeds": 3,
+    "final_mean_osi": 0.7977001265465374,
+    "final_sem_osi": 0.018516322764750976,
+    "final_osi_per_seed": [
+      0.7528348827678992,
+      0.8143728556599027,
+      0.8258926412118103
+    ]
+  }
+}

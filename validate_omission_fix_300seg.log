@@ -1,0 +1,100 @@
+/home/vysoforlife/miniconda3/envs/habitat/lib/python3.9/site-packages/scipy/__init__.py:146: UserWarning: A NumPy version >=1.17.3 and <1.25.0 is required for this version of SciPy (detected version 1.26.4
+  warnings.warn(f"A NumPy version >={np_minversion} and <{np_maxversion}"
+======================================================================
+Phase B Omission Fix Validation
+Protocol: Gavornik & Bear (2014) — 150ms elements, 800 presentations
+======================================================================
+
+======================================================================
+Test 1: g_exc_ee trace recording
+======================================================================
+  Trace shape: (4, 300, 16)
+  Expected:    (4, 300, 16)
+  Mean g_exc_ee: 0.000002
+    Element 0 (theta=0.0°): mean g_exc_ee = 0.000002
+    Element 1 (theta=45.0°): mean g_exc_ee = 0.000002
+    Element 2 (theta=90.0°): mean g_exc_ee = 0.000000
+    Element 3 (theta=135.0°): mean g_exc_ee = 0.000003
+
+  Omission trial: stim elements mean=0.000002, omitted element mean=0.000000
+
+  Test 1 PASSED: g_exc_ee trace recording works correctly
+
+======================================================================
+Test 4: Biological plausibility audit
+======================================================================
+  [OK] E→E STDP is pair-based with weight dependence
+  [OK] Phase B uses only E→E STDP (no feedforward)
+  [OK] Control condition uses novel orientation (22.5°)
+  [OK] No global E→E weight renormalization
+  [OK] Omission response averages over multiple evaluation trials
+
+  Test 4 PASSED: No non-biological hacks detected
+
+======================================================================
+Test 5: Performance benchmark
+======================================================================
+  Warming up JIT...
+  Timing 100 presentations (150ms elements, 1.5s ITI)...
+    100 presentations: 13.67s (136.7ms/trial)
+    Estimated 800 presentations: 109.3s (1.8min)
+
+  Test 5 PASSED: Estimated 109.3s for 800 presentations
+
+======================================================================
+Test 2: F>R ratio (800 presentations, 150ms elements)
+======================================================================
+
+  Phase A (300 segments, numpy, seed=42)...
+    Phase A: 50/300 segments done
+    Phase A: 100/300 segments done
+    Phase A: 150/300 segments done
+    Phase A: 200/300 segments done
+    Phase A: 250/300 segments done
+    Phase A: 300/300 segments done
+    Mean OSI after Phase A: 0.833
+  Calibrating E→E drive...
+  [calibrate] scale=1 → drive_frac=0.0001
+  [calibrate] scale=5 → drive_frac=0.0005
+  [calibrate] scale=20 → drive_frac=0.0018
+  [calibrate] scale=50 → drive_frac=0.0046
+  [calibrate] scale=100 → drive_frac=0.0091
+  [calibrate] scale=200 → drive_frac=0.0180
+  [calibrate] scale=500 → drive_frac=0.0439
+  [calibrate] scale=1000 → drive_frac=0.1825
+  [calibrate] scale=2000 → drive_frac=0.6909
+  [calibrate] refine scale=707.1 → drive_frac=0.0610
+  [calibrate] refine scale=840.9 → drive_frac=0.0832
+  [calibrate] refine scale=917.0 → drive_frac=0.0776
+  [calibrate] refine scale=957.6 → drive_frac=0.0808
+  [calibrate] WARNING: OSI=0.220 < floor=0.30 at scale=1000.0, backing off to 957.6
+  [calibrate] Final: scale=957.6 → drive_frac=0.0808, OSI=0.220
+    Calibration: scale=957.6, frac=0.0808
+    w_e_e_max=5.7456 (3× cal mean=1.9152)
+
+  [pres 0] F>R=1.0000 (fwd=1.915207, rev=1.915207)
+
+  Phase B training (800 presentations, element_ms=150.0, iti_ms=1500.0)...
+    [pres 100] F>R=0.8894 (fwd=1.840615, rev=2.069553), W_ee mean=2.01300 max=2.9982, elapsed=14.8s
+    [pres 200] F>R=0.8581 (fwd=1.851138, rev=2.157272), W_ee mean=2.09750 max=3.3907, elapsed=28.6s
+    [pres 400] F>R=0.7970 (fwd=1.759010, rev=2.207136), W_ee mean=2.13494 max=3.8521, elapsed=56.9s
+    [pres 600] F>R=0.7851 (fwd=1.787449, rev=2.276631), W_ee mean=2.15711 max=3.9975, elapsed=85.3s
+    [pres 800] F>R=0.7597 (fwd=1.727211, rev=2.273670), W_ee mean=2.15855 max=4.0587, elapsed=113.7s
+
+  Training completed in 113.7s
+  F>R trajectory: 1.000 → 0.889 → 0.858 → 0.797 → 0.785 → 0.760
+
+  Test 2: EXCEPTION — F>R must increase: 1.0000 → 0.7597
+Traceback (most recent call last):
+  File "/home/vysoforlife/code_files/und_OSI_formation_extend/Fold6_pvfix/validate_omission_fix.py", line 566, in main
+    result = test_fr_ratio()
+  File "/home/vysoforlife/code_files/und_OSI_formation_extend/Fold6_pvfix/validate_omission_fix.py", line 307, in test_fr_ratio
+    assert final_ratio > initial_ratio, \
+AssertionError: F>R must increase: 1.0000 → 0.7597
+
+======================================================================
+Test 3: Omission response (conductance-based)
+======================================================================
+
+  Phase A (300 segments, numpy, seed=42)...
+    Phase A: 50/300 segments done

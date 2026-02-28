@@ -1,0 +1,101 @@
+{
+  "M6_stp_OFF": {
+    "condition": "M6_stp_OFF",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8444929811077776,
+    "final_sem_osi": 0.004631611367771051,
+    "final_osi_per_seed": [
+      0.8547068724635501,
+      0.8436627777542144,
+      0.8351092931055686
+    ]
+  },
+  "M6_stp_E_only": {
+    "condition": "M6_stp_E_only",
+    "n_seeds": 3,
+    "final_mean_osi": 0.809355580573606,
+    "final_sem_osi": 0.013930102935079298,
+    "final_osi_per_seed": [
+      0.7763618859643193,
+      0.8333874820944058,
+      0.8183173736620928
+    ]
+  },
+  "M6_stp_PV_only": {
+    "condition": "M6_stp_PV_only",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8480768748508117,
+    "final_sem_osi": 0.0040080139006475985,
+    "final_osi_per_seed": [
+      0.8544558500524897,
+      0.8513503815991357,
+      0.8384243929008097
+    ]
+  },
+  "M6_stpu_0.00": {
+    "condition": "M6_stpu_0.00",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8444929811077776,
+    "final_sem_osi": 0.004631611367771051,
+    "final_osi_per_seed": [
+      0.8547068724635501,
+      0.8436627777542144,
+      0.8351092931055686
+    ]
+  },
+  "M6_stpu_0.02": {
+    "condition": "M6_stpu_0.02",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8358031563106136,
+    "final_sem_osi": 0.008263322078117294,
+    "final_osi_per_seed": [
+      0.8457301087386806,
+      0.8461159009829224,
+      0.8155634592102377
+    ]
+  },
+  "M6_stpu_0.05": {
+    "condition": "M6_stpu_0.05",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8462618943628284,
+    "final_sem_osi": 0.00811787116393761,
+    "final_osi_per_seed": [
+      0.8450987377530055,
+      0.829652354464433,
+      0.864034590871047
+    ]
+  },
+  "M6_stpu_0.10": {
+    "condition": "M6_stpu_0.10",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8460061448630247,
+    "final_sem_osi": 0.009773959217194123,
+    "final_osi_per_seed": [
+      0.8607869323535596,
+      0.8223052485081833,
+      0.8549262537273311
+    ]
+  },
+  "M6_stpu_0.20": {
+    "condition": "M6_stpu_0.20",
+    "n_seeds": 3,
+    "final_mean_osi": 0.8069914135247128,
+    "final_sem_osi": 0.03544153092491914,
+    "final_osi_per_seed": [
+      0.8844080695269647,
+      0.7342616871920846,
+      0.802304483855089
+    ]
+  },
+  "M6_stpu_0.50": {
+    "condition": "M6_stpu_0.50",
+    "n_seeds": 3,
+    "final_mean_osi": 0.0,
+    "final_sem_osi": 0.0,
+    "final_osi_per_seed": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+}
