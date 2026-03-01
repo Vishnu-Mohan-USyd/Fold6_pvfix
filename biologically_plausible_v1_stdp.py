@@ -1267,15 +1267,13 @@ class RgcLgnV1Network:
             cortex_w = hc_grid_w * hc_side
             self.cortex_h = cortex_h
             self.cortex_w = cortex_w
-            self.cortex_x = np.zeros(self.M, dtype=np.int32)
-            self.cortex_y = np.zeros(self.M, dtype=np.int32)
-            for i in range(self.M):
-                hc = i // self.M_per_hc
-                m_local = i % self.M_per_hc
-                hc_x = hc % hc_grid_w
-                hc_y = hc // hc_grid_w
-                self.cortex_x[i] = hc_x * hc_side + m_local % hc_side
-                self.cortex_y[i] = hc_y * hc_side + m_local // hc_side
+            idxs = np.arange(self.M, dtype=np.int32)
+            hc_ids = idxs // self.M_per_hc
+            m_locals = idxs % self.M_per_hc
+            hc_xs = hc_ids % hc_grid_w
+            hc_ys = hc_ids // hc_grid_w
+            self.cortex_x = (hc_xs * hc_side + m_locals % hc_side).astype(np.int32)
+            self.cortex_y = (hc_ys * hc_side + m_locals // hc_side).astype(np.int32)
             # No wrapping for multi-HC
             dx = np.abs(self.cortex_x[:, None] - self.cortex_x[None, :]).astype(np.int32)
             dy = np.abs(self.cortex_y[:, None] - self.cortex_y[None, :]).astype(np.int32)
@@ -1461,6 +1459,9 @@ class RgcLgnV1Network:
         d2_off = (self.X_off.astype(np.float32) ** 2 + self.Y_off.astype(np.float32) ** 2).astype(np.float32)
 
         def lgn_mask_vec(sigma: float) -> np.ndarray:
+            # Scale sigma with grid size to maintain relative spatial extent.
+            # Default sigma values (2.0, 3.0) are calibrated for N=8.
+            sigma = sigma * (p.N / 8.0)
             if sigma <= 0:
                 return np.ones(self.n_lgn, dtype=np.float32)
             if self.n_hc > 1:
@@ -1735,9 +1736,8 @@ class RgcLgnV1Network:
                     hc_env_on = np.ones(self.n_pix_per_hc, dtype=np.float32)
                     hc_env_off = np.ones(self.n_pix_per_hc, dtype=np.float32)
 
-                for m in range(self.M_per_hc):
-                    self.lgn_mask_e[hc * self.M_per_hc + m, on_slice] = hc_env_on
-                    self.lgn_mask_e[hc * self.M_per_hc + m, off_slice] = hc_env_off
+                self.lgn_mask_e[m_slice, on_slice] = hc_env_on[None, :]
+                self.lgn_mask_e[m_slice, off_slice] = hc_env_off[None, :]
 
                 if sigma_pv > 0:
                     hc_env_pv_on = np.exp(-d2_on / (2.0 * sigma_pv * sigma_pv)).astype(np.float32).ravel()
@@ -1750,11 +1750,9 @@ class RgcLgnV1Network:
                     hc_env_pv_off = np.ones(self.n_pix_per_hc, dtype=np.float32)
 
                 pv_start = hc * self.M_per_hc * p.n_pv_per_ensemble
-                for m in range(self.M_per_hc):
-                    for pv_k in range(p.n_pv_per_ensemble):
-                        pv_idx = pv_start + m * p.n_pv_per_ensemble + pv_k
-                        self.lgn_mask_pv[pv_idx, on_slice] = hc_env_pv_on
-                        self.lgn_mask_pv[pv_idx, off_slice] = hc_env_pv_off
+                pv_end = pv_start + self.M_per_hc * p.n_pv_per_ensemble
+                self.lgn_mask_pv[pv_start:pv_end, on_slice] = hc_env_pv_on[None, :]
+                self.lgn_mask_pv[pv_start:pv_end, off_slice] = hc_env_pv_off[None, :]
         else:
             self.lgn_mask_e = np.tile(self._lgn_mask_e_vec[None, :], (self.M, 1)).astype(np.float32)
             self.lgn_mask_pv = np.tile(self._lgn_mask_pv_vec[None, :], (self.n_pv, 1)).astype(np.float32)
@@ -1887,21 +1885,19 @@ class RgcLgnV1Network:
         self.W_lgn_pv *= self.tc_mask_pv_f32
 
         # Delays for LGN->PV. By default, inherit the parent ensemble's delays (keeps timing aligned).
-        self.D_pv = np.zeros((self.n_pv, self.n_lgn), dtype=np.int16)
-        for pv_idx in range(self.n_pv):
-            parent = pv_idx // p.n_pv_per_ensemble
-            self.D_pv[pv_idx, :] = self.D[parent, :]
+        pv_parents = np.arange(self.n_pv, dtype=np.int32) // max(1, int(p.n_pv_per_ensemble))
+        self.D_pv = self.D[pv_parents, :].copy()
 
         # --- Local inhibitory connectivity ---
         pv_parent = (np.arange(self.n_pv, dtype=np.int32) // max(1, int(p.n_pv_per_ensemble))).astype(np.int32, copy=False)
 
         # E->PV connectivity (local-to-nearby by default; sigma=0 recovers legacy private wiring).
         if float(p.pv_in_sigma) <= 0.0:
+            # Each E neuron m drives PV neurons [m*n_pv_per_ensemble : (m+1)*n_pv_per_ensemble]
             self.W_e_pv = np.zeros((self.n_pv, self.M), dtype=np.float32)
-            for m in range(self.M):
-                pv_start = m * p.n_pv_per_ensemble
-                pv_end = pv_start + p.n_pv_per_ensemble
-                self.W_e_pv[pv_start:pv_end, m] = p.w_e_pv
+            m_arr = np.arange(self.M)
+            for k in range(p.n_pv_per_ensemble):
+                self.W_e_pv[m_arr * p.n_pv_per_ensemble + k, m_arr] = p.w_e_pv
         else:
             sig = float(p.pv_in_sigma)
             d2_pv_e = self.cortex_dist2[pv_parent, :].astype(np.float32, copy=False)  # (n_pv, M)
@@ -1912,10 +1908,9 @@ class RgcLgnV1Network:
         # PV->E connectivity (local-to-nearby by default; sigma=0 recovers legacy private wiring).
         if float(p.pv_out_sigma) <= 0.0:
             self.W_pv_e = np.zeros((self.M, self.n_pv), dtype=np.float32)
-            for m in range(self.M):
-                pv_start = m * p.n_pv_per_ensemble
-                pv_end = pv_start + p.n_pv_per_ensemble
-                self.W_pv_e[m, pv_start:pv_end] = p.w_pv_e
+            m_arr = np.arange(self.M)
+            for k in range(p.n_pv_per_ensemble):
+                self.W_pv_e[m_arr, m_arr * p.n_pv_per_ensemble + k] = p.w_pv_e
         else:
             sig = float(p.pv_out_sigma)
             d2_e_pv = self.cortex_dist2[:, pv_parent].astype(np.float32, copy=False)  # (M, n_pv)
@@ -1938,93 +1933,75 @@ class RgcLgnV1Network:
 
         # E->SOM connectivity (can be long-range): E activity recruits SOM near the target site,
         # producing disynaptic long-range suppression without literal long-range inhibitory axons.
-        self.W_e_som = np.zeros((self.n_som, self.M), dtype=np.float32)
-        for som_idx in range(self.n_som):
-            m = som_idx // p.n_som_per_ensemble
-            kernel = np.zeros(self.M, dtype=np.float32)
-            for pre in range(self.M):
-                d2 = float(self.cortex_dist2[pre, m])
-                kernel[pre] = math.exp(-d2 / (2.0 * (p.som_in_sigma ** 2)))
-            kernel /= float(kernel.sum() + 1e-12)
-            self.W_e_som[som_idx, :] = p.w_e_som * kernel
+        # Vectorized: each SOM neuron som_idx is attached to E neuron m = som_idx // n_som_per_ensemble.
+        som_parent = np.arange(self.n_som, dtype=np.int32) // max(1, int(p.n_som_per_ensemble))
+        # d2_som_e[som_idx, pre] = cortex_dist2[pre, parent_m] — distance from each E to the SOM's parent
+        d2_som_e = self.cortex_dist2[:, som_parent].T.astype(np.float32)  # (n_som, M)
+        som_in_var = 2.0 * float(p.som_in_sigma) ** 2
+        kernel_e_som = np.exp(-d2_som_e / som_in_var).astype(np.float32)
+        kernel_e_som /= (kernel_e_som.sum(axis=1, keepdims=True) + 1e-12)
+        self.W_e_som = (float(p.w_e_som) * kernel_e_som).astype(np.float32)
 
         # SOM->E connectivity (local): SOM inhibits nearby excitatory neurons.
-        self.W_som_e = np.zeros((self.M, self.n_som), dtype=np.float32)
-        for som_idx in range(self.n_som):
-            m = som_idx // p.n_som_per_ensemble
-            kernel = np.zeros(self.M, dtype=np.float32)
-            for post in range(self.M):
-                d2 = float(self.cortex_dist2[post, m])
-                kernel[post] = math.exp(-d2 / (2.0 * (p.som_out_sigma ** 2)))
-            if not p.som_self_inhibit:
-                kernel[m] = 0.0
-            kernel /= float(kernel.sum() + 1e-12)
-            self.W_som_e[:, som_idx] = p.w_som_e * kernel
+        som_out_var = 2.0 * float(p.som_out_sigma) ** 2
+        d2_e_som = self.cortex_dist2[som_parent, :].astype(np.float32)  # reuse: (n_som, M) but transposed
+        # d2_e_som[som_idx, post] = cortex_dist2[parent_m, post]
+        kernel_som_e = np.exp(-d2_e_som / som_out_var).astype(np.float32)
+        if not p.som_self_inhibit:
+            # Zero out self-inhibition: SOM at parent m should not inhibit m
+            kernel_som_e[np.arange(self.n_som), som_parent] = 0.0
+        kernel_som_e /= (kernel_som_e.sum(axis=1, keepdims=True) + 1e-12)
+        self.W_som_e = (float(p.w_som_e) * kernel_som_e).T.astype(np.float32)  # (M, n_som)
 
         # Inter-HC SOM override: set inter-HC E→SOM and SOM→E weights explicitly.
         if self.n_hc > 1:
-            for som_idx in range(self.n_som):
-                m = som_idx // p.n_som_per_ensemble
-                hc_m = self.hc_id[m]
-                for pre in range(self.M):
-                    if self.hc_id[pre] != hc_m:
-                        d2 = float(self.cortex_dist2[pre, m])
-                        self.W_e_som[som_idx, pre] = p.inter_hc_som_w_e_som * math.exp(
-                            -d2 / (2.0 * (p.som_in_sigma ** 2)))
-            for som_idx in range(self.n_som):
-                m = som_idx // p.n_som_per_ensemble
-                hc_m = self.hc_id[m]
-                for post in range(self.M):
-                    if self.hc_id[post] != hc_m:
-                        d2 = float(self.cortex_dist2[post, m])
-                        self.W_som_e[post, som_idx] = p.inter_hc_som_w_som_e * math.exp(
-                            -d2 / (2.0 * (p.som_out_sigma ** 2)))
+            som_hc = self.hc_id[som_parent]  # HC of each SOM neuron
+            # inter_mask[som_idx, e_idx] = True if they belong to different HCs
+            inter_mask_e_som = (som_hc[:, None] != self.hc_id[None, :])  # (n_som, M)
+
+            inter_kernel_in = float(p.inter_hc_som_w_e_som) * np.exp(-d2_som_e / som_in_var)
+            self.W_e_som[inter_mask_e_som] = inter_kernel_in[inter_mask_e_som].astype(np.float32)
+
+            inter_kernel_out = float(p.inter_hc_som_w_som_e) * np.exp(-d2_e_som / som_out_var)
+            # W_som_e is (M, n_som), inter_kernel_out is (n_som, M) — transpose the mask
+            self.W_som_e.T[inter_mask_e_som] = inter_kernel_out[inter_mask_e_som].astype(np.float32)
 
         # VIP connectivity (local disinhibition): E -> VIP -> SOM.
         self.W_e_vip = np.zeros((self.n_vip, self.M), dtype=np.float32)
         self.W_vip_som = np.zeros((self.n_som, self.n_vip), dtype=np.float32)
         if self.n_vip > 0:
-            for m in range(self.M):
-                vip_start = m * p.n_vip_per_ensemble
-                vip_end = vip_start + p.n_vip_per_ensemble
-                self.W_e_vip[vip_start:vip_end, m] = p.w_e_vip
-                som_start = m * p.n_som_per_ensemble
-                som_end = som_start + p.n_som_per_ensemble
-                if p.w_vip_som != 0.0:
-                    self.W_vip_som[som_start:som_end, vip_start:vip_end] = float(p.w_vip_som) / max(
-                        1, int(p.n_vip_per_ensemble)
-                    )
+            m_arr = np.arange(self.M)
+            for k in range(p.n_vip_per_ensemble):
+                self.W_e_vip[m_arr * p.n_vip_per_ensemble + k, m_arr] = p.w_e_vip
+            if p.w_vip_som != 0.0:
+                w_vs = float(p.w_vip_som) / max(1, int(p.n_vip_per_ensemble))
+                for sk in range(p.n_som_per_ensemble):
+                    for vk in range(p.n_vip_per_ensemble):
+                        self.W_vip_som[m_arr * p.n_som_per_ensemble + sk,
+                                       m_arr * p.n_vip_per_ensemble + vk] = w_vs
 
         # --- Lateral excitatory connectivity ---
+        lat_var = 2.0 * float(p.lateral_sigma) ** 2
         self.W_e_e = np.zeros((self.M, self.M), dtype=np.float32)
         if p.ee_connectivity == "gaussian":
-            for i in range(self.M):
-                for j in range(self.M):
-                    if i != j:
-                        d2 = float(self.cortex_dist2[i, j])
-                        self.W_e_e[i, j] = p.w_e_e_lateral * math.exp(-d2 / (2.0 * p.lateral_sigma**2))
+            self.W_e_e = (float(p.w_e_e_lateral) * np.exp(-self.cortex_dist2 / lat_var)).astype(np.float32)
+            np.fill_diagonal(self.W_e_e, 0.0)
         elif p.ee_connectivity == "all_to_all":
             self.W_e_e[:] = float(p.w_e_e_baseline)
             np.fill_diagonal(self.W_e_e, 0.0)
         elif p.ee_connectivity == "gaussian_plus_baseline":
-            for i in range(self.M):
-                for j in range(self.M):
-                    if i != j:
-                        d2 = float(self.cortex_dist2[i, j])
-                        self.W_e_e[i, j] = (
-                            float(p.w_e_e_baseline)
-                            + p.w_e_e_lateral * math.exp(-d2 / (2.0 * p.lateral_sigma**2))
-                        )
+            self.W_e_e = (float(p.w_e_e_baseline)
+                          + float(p.w_e_e_lateral) * np.exp(-self.cortex_dist2 / lat_var)
+                          ).astype(np.float32)
+            np.fill_diagonal(self.W_e_e, 0.0)
         else:
             raise ValueError(f"Unknown ee_connectivity: {p.ee_connectivity!r}")
 
         # Inter-HC E→E override: set explicit inter-HC horizontal connection weights.
         if self.n_hc > 1 and p.inter_hc_w_e_e > 0:
-            for i in range(self.M):
-                for j in range(self.M):
-                    if self.hc_id[i] != self.hc_id[j]:
-                        d2 = float(self.cortex_dist2[i, j])
-                        self.W_e_e[i, j] = p.inter_hc_w_e_e * math.exp(-d2 / (2.0 * p.lateral_sigma**2))
+            inter_mask_ee = (self.hc_id[:, None] != self.hc_id[None, :])
+            inter_w = float(p.inter_hc_w_e_e) * np.exp(-self.cortex_dist2 / lat_var)
+            self.W_e_e[inter_mask_ee] = inter_w[inter_mask_ee].astype(np.float32)
 
         # Allow plasticity on all off-diagonal connections (structural plasticity can grow weights from 0).
         self.mask_e_e = np.ones((self.M, self.M), dtype=bool)
@@ -2062,25 +2039,22 @@ class RgcLgnV1Network:
 
         # For multi-HC, override inter-HC delays with distance-dependent conduction delays.
         if self.n_hc > 1:
-            # Compute HC-center distances for scaling delays.
-            hc_side = math.isqrt(self.M_per_hc)
-            for i in range(self.M):
-                for j in range(self.M):
-                    if i != j and self.hc_id[i] != self.hc_id[j]:
-                        # HC-level distance: adjacent=1, diagonal=sqrt(2)
-                        hc_i = int(self.hc_id[i])
-                        hc_j = int(self.hc_id[j])
-                        hc_ix, hc_iy = hc_i % self.hc_grid_w, hc_i // self.hc_grid_w
-                        hc_jx, hc_jy = hc_j % self.hc_grid_w, hc_j // self.hc_grid_w
-                        hc_dist = math.sqrt((hc_ix - hc_jx)**2 + (hc_iy - hc_jy)**2)
-                        # Scale: adjacent(1)=base, diagonal(sqrt(2))=base+range
-                        max_hc_dist = math.sqrt((self.hc_grid_w - 1)**2 + (self.hc_grid_h - 1)**2) if (self.hc_grid_w > 1 or self.hc_grid_h > 1) else 1.0
-                        frac = (hc_dist - 1.0) / max(1e-6, max_hc_dist - 1.0) if max_hc_dist > 1.0 else 0.0
-                        frac = max(0.0, min(1.0, frac))
-                        delay_ms = p.inter_hc_delay_base_ms + frac * p.inter_hc_delay_range_ms
-                        delay_steps = max(delay_min_steps, int(round(delay_ms / p.dt_ms)))
-                        delay_steps = min(delay_steps, delay_max_steps)
-                        self.D_ee[i, j] = delay_steps
+            # Compute HC-level grid coordinates for all neurons
+            hc_arr = self.hc_id.astype(np.int32)
+            hc_gx = (hc_arr % self.hc_grid_w).astype(np.float32)
+            hc_gy = (hc_arr // self.hc_grid_w).astype(np.float32)
+            # HC-level pairwise distance
+            hc_dx = hc_gx[:, None] - hc_gx[None, :]
+            hc_dy = hc_gy[:, None] - hc_gy[None, :]
+            hc_dist = np.sqrt(hc_dx * hc_dx + hc_dy * hc_dy)
+            max_hc_dist = math.sqrt((self.hc_grid_w - 1)**2 + (self.hc_grid_h - 1)**2) if (self.hc_grid_w > 1 or self.hc_grid_h > 1) else 1.0
+            frac_arr = np.clip((hc_dist - 1.0) / max(1e-6, max_hc_dist - 1.0), 0.0, 1.0) if max_hc_dist > 1.0 else np.zeros_like(hc_dist)
+            delay_ms_arr = p.inter_hc_delay_base_ms + frac_arr * p.inter_hc_delay_range_ms
+            delay_steps_arr = np.clip(np.round(delay_ms_arr / p.dt_ms), delay_min_steps, delay_max_steps).astype(np.int16)
+            # Apply only to inter-HC pairs (different HC, not self)
+            inter_mask_delay = (hc_arr[:, None] != hc_arr[None, :])
+            np.fill_diagonal(inter_mask_delay, False)
+            self.D_ee[inter_mask_delay] = delay_steps_arr[inter_mask_delay]
 
         # --- Laminar (L4 -> L2/3) connectivity (optional) ---
         # Implemented as a fixed Gaussian kernel on the same cortical geometry used for lateral E->E.
@@ -2091,10 +2065,9 @@ class RgcLgnV1Network:
             if sig <= 0.0:
                 np.fill_diagonal(self.W_l4_l23, float(p.w_l4_l23))
             else:
-                for post in range(self.M):
-                    kernel = np.exp(-self.cortex_dist2[:, post] / (2.0 * sig * sig)).astype(np.float32)
-                    kernel /= float(kernel.sum() + 1e-12)
-                    self.W_l4_l23[post, :] = float(p.w_l4_l23) * kernel
+                kernel = np.exp(-self.cortex_dist2 / (2.0 * sig * sig)).astype(np.float32)
+                kernel /= (kernel.sum(axis=0, keepdims=True) + 1e-12)
+                self.W_l4_l23 = (float(p.w_l4_l23) * kernel.T).astype(np.float32)
 
         # --- Plasticity mechanisms ---
         self.stdp = TripletSTDP(

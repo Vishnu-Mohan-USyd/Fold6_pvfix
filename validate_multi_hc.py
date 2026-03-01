@@ -467,11 +467,13 @@ def _import_jax():
     from network_jax import (numpy_net_to_jax_state, jax_state_to_numpy_net,
                               run_segment_jax, evaluate_tuning_jax,
                               reset_state_jax, calibrate_ee_drive_jax,
-                              run_sequence_trial_jax)
+                              run_sequence_trial_jax, prepare_phaseb_ee,
+                              synaptic_scale_ee)
     return jax, jnp, (numpy_net_to_jax_state, jax_state_to_numpy_net,
                        run_segment_jax, evaluate_tuning_jax,
                        reset_state_jax, calibrate_ee_drive_jax,
-                       run_sequence_trial_jax)
+                       run_sequence_trial_jax, prepare_phaseb_ee,
+                       synaptic_scale_ee)
 
 
 # ============================================================================
@@ -630,7 +632,8 @@ def test_jax_phase_b_fr():
         jax, jnp, (numpy_net_to_jax_state, jax_state_to_numpy_net,
                      run_segment_jax, evaluate_tuning_jax,
                      reset_state_jax, calibrate_ee_drive_jax,
-                     run_sequence_trial_jax) = _import_jax()
+                     run_sequence_trial_jax, prepare_phaseb_ee,
+                     synaptic_scale_ee) = _import_jax()
 
         # Phase A: train 100 segments with JAX
         p = Params(M=16, N=8, seed=42, n_hc=4, segment_ms=300)
@@ -657,16 +660,11 @@ def test_jax_phase_b_fr():
         cal_time = time.time() - t0
         print(f"  (E->E calibration: scale={best_scale:.1f}, frac={best_frac:.4f}, {cal_time:.1f}s)")
 
-        # Apply calibrated W_e_e
-        W_e_e_orig = state.W_e_e
-        eye_M = jnp.eye(int(static.M), dtype=jnp.float32)
-        W_e_e_cal = W_e_e_orig * best_scale * (1.0 - eye_M)
-        cal_mean = float(jnp.mean(W_e_e_cal[W_e_e_cal > 0])) if float(jnp.sum(W_e_e_cal > 0)) > 0 else 0.001
-        w_e_e_max = cal_mean * 3.0
-
-        # Update static with new w_e_e_max
-        static = static._replace(w_e_e_max=w_e_e_max)
-        state = state._replace(W_e_e=W_e_e_cal)
+        # Apply calibration with correct multi-HC handling:
+        # - Intra-HC weights scaled, inter-HC at biological baseline
+        # - w_e_e_max from intra-HC calibrated mean
+        # - Synaptic scaling targets from calibrated row sums
+        state, static, target_row_sums, intra_mask = prepare_phaseb_ee(state, static, best_scale)
 
         # Build sequence using pre-calibration preferred orientations
         # Pick 4 well-separated preferred orientations
@@ -690,6 +688,7 @@ def test_jax_phase_b_fr():
                 state, static, seq_thetas, element_ms, iti_ms,
                 contrast=1.0, plastic_mode='ee',
                 ee_A_plus_eff=A_plus, ee_A_minus_eff=A_minus)
+            state = synaptic_scale_ee(state, target_row_sums, intra_mask)
 
             # Measure F>R every 50 presentations
             if (pres + 1) % 50 == 0:

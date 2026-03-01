@@ -210,7 +210,9 @@ class StaticConfig(NamedTuple):
     ee_stdp_A_minus: float
     ee_stdp_weight_dep: bool
     w_e_e_min: float
-    w_e_e_max: float
+    w_e_e_max: float         # Intra-HC STDP ceiling (cal_mean_intra * headroom)
+    w_e_e_max_inter: float   # Inter-HC STDP ceiling (inter_mean * headroom, n_hc>1 only)
+    intra_hc_mask: jnp.ndarray  # (M, M) float32 intra-HC off-diag mask (or empty for n_hc=1)
     # Multi-HC support
     n_hc: int                    # Number of hypercolumns (1=legacy)
     n_pix_per_hc: int            # N*N (pixels per HC)
@@ -659,6 +661,8 @@ def numpy_net_to_jax_state(net) -> Tuple[SimState, StaticConfig]:
         ee_stdp_weight_dep=bool(p.ee_stdp_weight_dep),
         w_e_e_min=float(p.w_e_e_min),
         w_e_e_max=float(p.w_e_e_max),
+        w_e_e_max_inter=float(p.w_e_e_max),  # same as intra at init; overridden in prepare_phaseb_ee
+        intra_hc_mask=jnp.zeros((0,), dtype=jnp.float32),  # populated in prepare_phaseb_ee for n_hc>1
         # Multi-HC
         n_hc=int(n_hc),
         n_pix_per_hc=int(n_pix_per_hc),
@@ -1727,17 +1731,25 @@ def timestep_phaseb_plastic(state, static, t_ms, theta_deg, phase, contrast, ste
         state, static, t_ms, theta_deg, phase, contrast, step_key)
 
     # --- Flat E→E STDP (used for all n_hc values) ---
+    # Build per-synapse STDP ceiling: intra-HC and inter-HC populations have
+    # different maximum synaptic efficacy (Bosking 1997, McGuire 1991).
+    if s.n_hc > 1:
+        w_max_matrix = (s.w_e_e_max * s.intra_hc_mask
+                        + s.w_e_e_max_inter * (1.0 - s.intra_hc_mask) * (1.0 - s.eye_M))
+    else:
+        w_max_matrix = s.w_e_e_max  # scalar broadcast
+
     pre_trace, post_trace, dW_ee = delay_aware_ee_stdp_update(
         new_state.ee_pre_trace, new_state.ee_post_trace,
         ee_arrivals, v1_spk,
         new_state.W_e_e, s.mask_e_e,
         s.ee_stdp_decay_pre, s.ee_stdp_decay_post,
         ee_A_plus_eff, ee_A_minus_eff,
-        s.w_e_e_min, s.w_e_e_max,
+        s.w_e_e_min, w_max_matrix,
         s.ee_stdp_weight_dep)
 
     W_e_e_new = new_state.W_e_e + dW_ee
-    W_e_e_new = jnp.clip(W_e_e_new, s.w_e_e_min, s.w_e_e_max)
+    W_e_e_new = jnp.clip(W_e_e_new, s.w_e_e_min, w_max_matrix)
     W_e_e_new = W_e_e_new * (1.0 - s.eye_M)  # zero diagonal
 
     # Homeostatic rate estimate
@@ -2400,6 +2412,19 @@ def evaluate_tuning_jax(state, static, thetas_deg, repeats=1, contrast=1.0):
     return rates.astype(np.float32)
 
 
+def _build_intra_hc_mask(n_hc: int, M_per_hc: int) -> np.ndarray:
+    """Build boolean mask selecting intra-HC off-diagonal entries.
+
+    Returns (M, M) bool array where True = same HC and i != j.
+    For n_hc=1, all off-diagonal entries are True.
+    """
+    M = n_hc * M_per_hc
+    hc_ids = np.repeat(np.arange(n_hc), M_per_hc)
+    intra = (hc_ids[:, None] == hc_ids[None, :])
+    np.fill_diagonal(intra, False)
+    return intra
+
+
 def calibrate_ee_drive_jax(
     state: SimState,
     static: StaticConfig,
@@ -2411,36 +2436,42 @@ def calibrate_ee_drive_jax(
 ) -> Tuple[float, float]:
     """JAX-native binary-search W_e_e scale to hit target E→E drive fraction.
 
-    Mirrors ``calibrate_ee_drive`` from biologically_plausible_v1_stdp.py but
-    runs entirely on JAX (GPU-accelerated).  Uses ``run_segment_jax`` for
-    evaluation probes and reads the drive accumulators from the returned state.
+    For multi-HC networks (n_hc > 1), only **intra-HC** weights are scaled.
+    Inter-HC (horizontal) weights are kept at their biologically initialized
+    values.  This is because the calibration adjusts local recurrent gain
+    within each column — horizontal connections between columns are a
+    separate anatomical population with their own baseline strength set by
+    ``Params.inter_hc_w_e_e`` and Gaussian distance decay.
 
-    The original state is not mutated — each measurement probe resets dynamic
-    state (via ``reset_state_jax``) while preserving weights, matching the
-    numpy version's save/restore pattern.
+    Scaling both populations uniformly causes inter-HC weights (which are
+    ~100x weaker but ~67x more numerous at n_hc=64) to contribute ~33% of
+    total E→E drive as non-selective noise, washing out sequential STDP
+    signals during Phase B.
+
+    For n_hc=1, all off-diagonal weights are intra-HC, so the behavior is
+    identical to the original uniform-scale implementation.
 
     Parameters
     ----------
     state : SimState
-        Network state after Phase A (W_e_e should be the initial values —
-        only feedforward STDP is applied during Phase A, so W_e_e is unchanged).
+        Network state after Phase A.
     static : StaticConfig
-        Network configuration (scalar parameters, connectivity matrices).
+        Network configuration.
     target_frac : float
         Desired fraction of excitatory drive from recurrent E→E connections.
     reference_theta : float
-        Grating orientation for measurement probes (default 90.0°).
+        Grating orientation for measurement probes (default 90.0).
     osi_floor : float
-        Reject scales that push mean OSI below this threshold (default 0.30).
+        Reject scales that push mean OSI below this threshold.
     contrast : float
-        Stimulus contrast for measurement probes (default 1.0).
+        Stimulus contrast for measurement probes.
     scales : list of float or None
-        Override coarse sweep scales. Default covers 1–5000.
+        Override coarse sweep scales.
 
     Returns
     -------
     best_scale : float
-        Scale factor for W_e_e that achieves the target drive fraction.
+        Scale factor for **intra-HC** W_e_e entries.
     best_frac : float
         Achieved drive fraction at best_scale.
     """
@@ -2451,10 +2482,28 @@ def calibrate_ee_drive_jax(
 
     W_e_e_orig = state.W_e_e
     M = int(static.M)
+    n_hc = int(static.n_hc)
+    M_per_hc = int(static.M_per_hc)
     eye_M = jnp.eye(M, dtype=jnp.float32)
 
+    # For n_hc > 1, build intra/inter masks so we only scale intra-HC weights.
+    # Inter-HC weights remain at their biological baseline throughout calibration.
+    if n_hc > 1:
+        intra_bool = _build_intra_hc_mask(n_hc, M_per_hc)
+        intra_mask_jax = jnp.array(intra_bool.astype(np.float32))
+        inter_mask_jax = (1.0 - intra_mask_jax) * (1.0 - eye_M)
+        W_inter_fixed = W_e_e_orig * inter_mask_jax  # inter-HC weights (constant)
+    else:
+        intra_mask_jax = None  # not needed — all weights are intra-HC
+
+    def _build_W_scaled(scale_val):
+        """Build W_e_e with intra-HC scaled, inter-HC fixed."""
+        if n_hc > 1:
+            return W_e_e_orig * scale_val * intra_mask_jax + W_inter_fixed
+        else:
+            return W_e_e_orig * scale_val * (1.0 - eye_M)
+
     # Use multiple orientations for robust drive fraction measurement
-    # (avoids sensitivity to a single RNG-derived grating phase)
     probe_thetas = [0.0, 45.0, 90.0, 135.0]
 
     def _measure_drive_frac(W_e_e_scaled):
@@ -2473,10 +2522,9 @@ def calibrate_ee_drive_jax(
         return total_ee / denom if denom > 0 else 0.0
 
     # --- Coarse sweep ---
-    # Track ALL probed (scale, frac) pairs for OSI back-off
     all_probes = []
     for s in scales:
-        W_scaled = W_e_e_orig * s * (1.0 - eye_M)
+        W_scaled = _build_W_scaled(s)
         frac = _measure_drive_frac(W_scaled)
         all_probes.append((s, frac))
         print(f"  [calibrate_jax] scale={s:.0f} → drive_frac={frac:.4f}")
@@ -2498,7 +2546,7 @@ def calibrate_ee_drive_jax(
         mid_scale = math.sqrt(lo_scale * hi_scale)  # geometric midpoint
         if abs(hi_scale - lo_scale) / max(1e-8, hi_scale) < 0.05:
             break
-        W_scaled = W_e_e_orig * mid_scale * (1.0 - eye_M)
+        W_scaled = _build_W_scaled(mid_scale)
         mid_frac = _measure_drive_frac(W_scaled)
         all_probes.append((mid_scale, mid_frac))
         print(f"  [calibrate_jax] refine scale={mid_scale:.1f} → "
@@ -2518,21 +2566,19 @@ def calibrate_ee_drive_jax(
     thetas_check = np.linspace(0, 180, 8, endpoint=False)
 
     def _check_osi(scale_val):
-        W_test = W_e_e_orig * scale_val * (1.0 - eye_M)
+        W_test = _build_W_scaled(scale_val)
         state_test = state._replace(W_e_e=W_test)
         rates_test = evaluate_tuning_jax(
             state_test, static, thetas_check, repeats=2, contrast=contrast)
         osi_test, _ = compute_osi(rates_test, thetas_check)
         return float(osi_test.mean())
 
-    # Small tolerance for float32→float64 rounding in OSI comparison
     osi_tol = 1e-3
 
     osi_mean = _check_osi(best_scale)
     if osi_mean < osi_floor - osi_tol:
         print(f"  [calibrate_jax] WARNING: OSI={osi_mean:.3f} < "
               f"floor={osi_floor:.2f} at scale={best_scale:.1f}")
-        # Sort all probed scales descending and try the highest that passes OSI
         all_probes_sorted = sorted(all_probes, key=lambda x: x[0], reverse=True)
         backed_off = False
         for s, f in all_probes_sorted:
@@ -2557,3 +2603,206 @@ def calibrate_ee_drive_jax(
     print(f"  [calibrate_jax] Final: scale={best_scale:.1f} → "
           f"drive_frac={best_frac:.4f}, OSI={osi_mean:.3f}")
     return best_scale, best_frac
+
+
+def prepare_phaseb_ee(
+    state: SimState,
+    static: StaticConfig,
+    best_scale: float,
+    w_max_headroom: float = 3.0,
+) -> Tuple[SimState, StaticConfig]:
+    """Apply E→E calibration and prepare state/static for Phase B.
+
+    Applies the calibration scale from ``calibrate_ee_drive_jax`` consistently:
+    for n_hc > 1, only **intra-HC** weights are scaled (matching what the
+    calibration procedure optimized), while inter-HC weights stay at their
+    biological baseline.  For n_hc=1, all weights are scaled uniformly.
+
+    The STDP ceiling ``w_e_e_max`` is a (M, M) matrix with population-specific
+    values.  For n_hc > 1:
+      - Intra-HC ceiling = ``cal_mean_intra * headroom`` (~4.8 at default params)
+      - Inter-HC ceiling = ``inter_mean * headroom`` (~0.00013 at default params)
+
+    This is biologically grounded: horizontal connections between cortical
+    columns have lower maximum synaptic efficacy than local recurrent
+    connections (Bosking et al. 1997; McGuire et al. 1991; Stettler et al. 2002).
+    Without population-specific ceilings, weight-dependent STDP gives inter-HC
+    weights an effectively additive learning rate (since a single w_max >> W_inter),
+    causing them to grow to intra-HC levels within ~200 presentations and wash
+    out sequential weight asymmetry.
+
+    All connections remain plastic — ``mask_e_e`` is unchanged.
+
+    Parameters
+    ----------
+    state : SimState
+        Network state after Phase A training.
+    static : StaticConfig
+        Network configuration.
+    best_scale : float
+        Calibration scale factor from ``calibrate_ee_drive_jax`` (applied
+        only to intra-HC weights for n_hc > 1).
+    w_max_headroom : float
+        Multiplier on mean calibrated intra-HC weight for STDP ceiling.
+
+    Returns
+    -------
+    (state, static, target_row_sums, intra_mask) :
+        Updated state with calibrated W_e_e, updated static with scalar
+        w_e_e_max, target totals for ``synaptic_scale_ee()`` [(M, 2) for
+        multi-HC with columns [intra, inter], or (M,) for n_hc=1], and
+        intra-HC mask [(M, M) float32 or None for n_hc=1].
+    """
+    M = int(static.M)
+    n_hc = int(static.n_hc)
+    M_per_hc = int(static.M_per_hc)
+    eye_M = jnp.eye(M, dtype=jnp.float32)
+
+    if n_hc > 1:
+        # Intra-HC-only scaling (matching calibration procedure)
+        intra_bool = _build_intra_hc_mask(n_hc, M_per_hc)
+        intra_mask_jax = jnp.array(intra_bool.astype(np.float32))
+        inter_mask_jax = (1.0 - intra_mask_jax) * (1.0 - eye_M)
+        W_e_e_cal = (state.W_e_e * best_scale * intra_mask_jax
+                     + state.W_e_e * inter_mask_jax)
+
+        # Population-specific STDP ceilings.
+        # Biologically, horizontal (inter-HC) connections have lower maximum
+        # synaptic efficacy than local (intra-HC) connections:
+        #   - Local recurrent synapses: multiple release sites, proximal dendrites
+        #   - Horizontal synapses: fewer release sites, distal dendrites
+        # (Bosking et al. 1997; McGuire et al. 1991; Stettler et al. 2002)
+        #
+        # Without population-specific ceilings, weight-dependent STDP
+        # (LTP ∝ w_max - W) gives inter-HC weights an effectively additive
+        # learning rate (since w_max >> W_inter), causing them to grow to
+        # intra-HC levels within ~200 presentations and wash out the
+        # sequential asymmetry.
+        W_cal_np = np.array(W_e_e_cal)
+        intra_vals = W_cal_np[intra_bool]
+        intra_pos = intra_vals[intra_vals > 0]
+        cal_mean_intra = float(intra_pos.mean()) if len(intra_pos) > 0 else 0.001
+        w_max_intra = cal_mean_intra * w_max_headroom
+
+        inter_bool = ~intra_bool
+        np.fill_diagonal(inter_bool, False)
+        inter_vals = W_cal_np[inter_bool]
+        inter_pos = inter_vals[inter_vals > 0]
+        inter_mean = float(inter_pos.mean()) if len(inter_pos) > 0 else 0.0
+        # Same proportional headroom for inter-HC (3× their baseline mean)
+        w_max_inter = inter_mean * w_max_headroom if inter_mean > 0 else 0.001
+
+        print(f"  [prepare_phaseb_ee] n_hc={n_hc}: "
+              f"intra cal_mean={cal_mean_intra:.6f} → w_max_intra={w_max_intra:.4f}, "
+              f"inter mean={inter_mean:.6f} → w_max_inter={w_max_inter:.6f}")
+    else:
+        # n_hc=1: all off-diagonal weights are intra-HC
+        intra_mask_jax = None
+        W_e_e_cal = state.W_e_e * best_scale * (1.0 - eye_M)
+        W_cal_np = np.array(W_e_e_cal)
+        pos_mask = W_cal_np > 0
+        cal_mean = float(W_cal_np[pos_mask].mean()) if pos_mask.any() else 0.001
+        w_max_intra = cal_mean * w_max_headroom
+        w_max_inter = w_max_intra  # unused for n_hc=1
+        print(f"  [prepare_phaseb_ee] n_hc=1: cal_mean={cal_mean:.6f}, "
+              f"w_e_e_max={w_max_intra:.4f}")
+
+    state = state._replace(W_e_e=W_e_e_cal)
+    # Store two scalar ceilings + intra-HC mask for population-specific STDP
+    static = static._replace(
+        w_e_e_max=w_max_intra,
+        w_e_e_max_inter=w_max_inter,
+        intra_hc_mask=intra_mask_jax if intra_mask_jax is not None
+                      else jnp.zeros((0,), dtype=jnp.float32),
+    )
+
+    # Compute per-neuron target total incoming E→E weight for synaptic scaling
+    # (still returned for callers that want it, but NOT required — the
+    # population-specific w_e_e_max makes weight-dependent STDP self-regulating
+    # for both populations, so synaptic scaling is optional).
+    if n_hc > 1:
+        W_intra = W_e_e_cal * intra_mask_jax
+        W_inter = W_e_e_cal * inter_mask_jax
+        target_intra = jnp.sum(W_intra, axis=1)  # (M,)
+        target_inter = jnp.sum(W_inter, axis=1)  # (M,)
+        target_row_sums = jnp.stack([target_intra, target_inter], axis=1)  # (M, 2)
+        return state, static, target_row_sums, intra_mask_jax
+    else:
+        target_row_sums = jnp.sum(W_e_e_cal, axis=1)  # (M,)
+        return state, static, target_row_sums, None
+
+
+def synaptic_scale_ee(state: SimState, target_row_sums: jnp.ndarray,
+                      intra_mask: jnp.ndarray = None,
+                      eps: float = 1e-8) -> SimState:
+    """Apply multiplicative synaptic scaling to E→E weights.
+
+    Implements Turrigiano-style homeostatic synaptic scaling (Turrigiano 2008,
+    Ann. Rev. Neurosci.) at the E→E weight level.  Each postsynaptic neuron's
+    incoming E→E weights are multiplicatively rescaled so their total matches
+    the calibration-time target.
+
+    For multi-HC networks, scaling is applied **separately** to intra-HC and
+    inter-HC incoming weight populations (when ``intra_mask`` is provided).
+    This prevents inter-HC weight growth from stealing weight budget from
+    intra-HC connections, preserving the relative sequential structure learned
+    by intra-HC STDP.  Synapse-type-specific scaling is biologically grounded:
+    different presynaptic populations (local vs distant) are scaled independently
+    (Turrigiano & Nelson 2004, Nat. Rev. Neurosci.; Lee et al. 2014).
+
+    For n_hc=1 (``intra_mask=None``), all incoming weights are scaled together.
+
+    Should be called after each Phase B plastic trial::
+
+        state, static, target_row_sums = prepare_phaseb_ee(state, static, scale)
+        intra_mask = ...  # from _build_intra_hc_mask(), as float32 jnp array
+        for pres in range(n_presentations):
+            state, info = run_sequence_trial_jax(state, static, seq, ..., plastic_mode='ee')
+            state = synaptic_scale_ee(state, target_row_sums, intra_mask)
+
+    Parameters
+    ----------
+    state : SimState
+        State after a plastic trial (W_e_e may have grown via STDP).
+    target_row_sums : (M, 2) or (M,) jnp.ndarray
+        Per-neuron target totals. If shape (M, 2), column 0 = intra-HC target,
+        column 1 = inter-HC target. If shape (M,), used as total target
+        (no intra/inter distinction).
+    intra_mask : (M, M) jnp.ndarray or None
+        Boolean mask (as float32) where 1.0 = intra-HC, 0.0 = inter-HC/diagonal.
+        If None, all weights are scaled together.
+    eps : float
+        Small constant to avoid division by zero.
+
+    Returns
+    -------
+    SimState with W_e_e rescaled so each neuron's incoming totals match targets.
+    """
+    W = state.W_e_e
+
+    if intra_mask is not None and target_row_sums.ndim == 2:
+        # Separate scaling for intra-HC and inter-HC populations
+        inter_mask = 1.0 - intra_mask  # includes diagonal (zeros), OK because W diagonal is 0
+
+        W_intra = W * intra_mask
+        W_inter = W * inter_mask
+
+        intra_sums = jnp.sum(W_intra, axis=1)  # (M,)
+        inter_sums = jnp.sum(W_inter, axis=1)  # (M,)
+
+        target_intra = target_row_sums[:, 0]
+        target_inter = target_row_sums[:, 1]
+
+        scale_intra = target_intra / (intra_sums + eps)
+        scale_inter = target_inter / (inter_sums + eps)
+
+        W_scaled = (W_intra * scale_intra[:, None]
+                    + W_inter * scale_inter[:, None])
+    else:
+        # Single-population scaling (n_hc=1 or simple mode)
+        targets = target_row_sums if target_row_sums.ndim == 1 else target_row_sums[:, 0]
+        current_sums = jnp.sum(W, axis=1)
+        scale = targets / (current_sums + eps)
+        W_scaled = W * scale[:, None]
+
+    return state._replace(W_e_e=W_scaled)
