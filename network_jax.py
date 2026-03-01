@@ -91,6 +91,21 @@ class SimState(NamedTuple):
     rate_avg_hc: jnp.ndarray          # (n_hc, M_per_hc) or (1,1) placeholder
     I_v1_bias_hc: jnp.ndarray         # (n_hc, M_per_hc) or (1,1) placeholder
     pv_istdp_x_post_hc: jnp.ndarray  # (n_hc, M_per_hc) or (1,1) placeholder
+    # --- Per-HC PV batched arrays (populated only when n_hc > 1) ---
+    pv_v_hc: jnp.ndarray            # (n_hc, n_pv_per_hc) or (1,1) placeholder
+    pv_u_hc: jnp.ndarray            # (n_hc, n_pv_per_hc) or (1,1) placeholder
+    I_pv_hc: jnp.ndarray            # (n_hc, n_pv_per_hc) or (1,1) placeholder
+    I_pv_inh_hc: jnp.ndarray        # (n_hc, n_pv_per_hc) or (1,1) placeholder
+    g_v1_inh_pv_rise_hc: jnp.ndarray  # (n_hc, M_per_hc) or (1,1) placeholder
+    g_v1_inh_pv_decay_hc: jnp.ndarray # (n_hc, M_per_hc) or (1,1) placeholder
+    W_pv_e_hc: jnp.ndarray          # (n_hc, M_per_hc, n_pv_per_hc) or (1,1,1) placeholder
+    # --- Per-HC E→E batched arrays (populated only when n_hc > 1) ---
+    W_e_e_hc: jnp.ndarray            # (n_hc, M_per_hc, M_per_hc) or (1,1,1) placeholder
+    ee_pre_trace_hc: jnp.ndarray     # (n_hc, M_per_hc, M_per_hc) or (1,1,1) placeholder
+    ee_post_trace_hc: jnp.ndarray    # (n_hc, M_per_hc) or (1,1) placeholder
+    delay_buf_ee_hc: jnp.ndarray     # (n_hc, L_ee, M_per_hc) or (1,1,1) placeholder
+    g_exc_ee_hc: jnp.ndarray         # (n_hc, M_per_hc) or (1,1) placeholder
+    drive_acc_ee_hc: jnp.ndarray     # (n_hc, M_per_hc) or (1,1) placeholder
 
 
 class StaticConfig(NamedTuple):
@@ -237,6 +252,19 @@ class StaticConfig(NamedTuple):
     D_pv_hc: jnp.ndarray            # (n_hc, n_pv_per_hc, n_lgn_per_hc) int32 or (1,1,1) placeholder
     tc_mask_pv_hc: jnp.ndarray      # (n_hc, n_pv_per_hc, n_lgn_per_hc) or (1,1,1) placeholder
     n_pv_per_hc: int                 # n_pv // n_hc
+    # Per-HC PV static arrays (block-diagonal only — inter-HC PV dropped per validation)
+    W_e_pv_hc: jnp.ndarray         # (n_hc, n_pv_per_hc, M_per_hc) or (1,1,1) placeholder
+    W_pv_e_hc: jnp.ndarray         # (n_hc, M_per_hc, n_pv_per_hc) or (1,1,1) placeholder  [static copy of initial W_pv_e blocks]
+    mask_pv_e_hc: jnp.ndarray      # (n_hc, M_per_hc, n_pv_per_hc) or (1,1,1) placeholder
+    n_som_per_hc: int               # n_som // n_hc
+    # SOM skip: True when SOM can be skipped for multi-HC (compile-time bool)
+    som_skip: bool                   # True => skip SOM matmuls entirely (default multi-HC: w_e_som=0, w_som_e=0)
+    # Per-HC E→E static arrays (populated only when n_hc > 1)
+    D_ee_hc: jnp.ndarray            # (n_hc, M_per_hc, M_per_hc) int32 or (1,1,1) placeholder
+    mask_e_e_hc: jnp.ndarray        # (n_hc, M_per_hc, M_per_hc) or (1,1,1) placeholder
+    eye_per_hc: jnp.ndarray         # (M_per_hc, M_per_hc) identity or (1,1) placeholder
+    arange_per_hc: jnp.ndarray      # (M_per_hc,) int32 or (1,) placeholder
+    W_e_e_inter_flat: jnp.ndarray   # (M_total, M_total) inter-HC weights for reconstruction
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +362,34 @@ def _extract_per_hc_delay_buf(flat_buf, n_hc, n_pix_per_hc, n_pix_total):
         result[hc, :, :n_pix_per_hc] = flat_buf[:, on_s:on_e]
         result[hc, :, n_pix_per_hc:] = flat_buf[:, off_s:off_e]
     return result
+
+
+def _extract_diag_blocks(flat_mat, n_hc, rows_per_hc, cols_per_hc):
+    """Extract diagonal blocks from a flat (n_rows_total, n_cols_total) matrix.
+
+    Returns (n_hc, rows_per_hc, cols_per_hc) numpy array (intra-HC blocks)
+    and the residual (inter-HC) matrix of the same shape as flat_mat.
+
+    Parameters
+    ----------
+    flat_mat : (n_rows_total, n_cols_total) numpy array
+    n_hc : int
+    rows_per_hc : int — rows per diagonal block
+    cols_per_hc : int — cols per diagonal block
+
+    Returns
+    -------
+    blocks : (n_hc, rows_per_hc, cols_per_hc) — diagonal blocks
+    inter : (n_rows_total, n_cols_total) — inter-HC residual (diagonal zeroed)
+    """
+    blocks = np.zeros((n_hc, rows_per_hc, cols_per_hc), dtype=flat_mat.dtype)
+    inter = np.array(flat_mat, copy=True)
+    for hc in range(n_hc):
+        r_s, r_e = hc * rows_per_hc, (hc + 1) * rows_per_hc
+        c_s, c_e = hc * cols_per_hc, (hc + 1) * cols_per_hc
+        blocks[hc] = flat_mat[r_s:r_e, c_s:c_e]
+        inter[r_s:r_e, c_s:c_e] = 0.0
+    return blocks, inter
 
 
 def numpy_net_to_jax_state(net) -> Tuple[SimState, StaticConfig]:
@@ -469,6 +525,78 @@ def numpy_net_to_jax_state(net) -> Tuple[SimState, StaticConfig]:
         D_pv_hc = jnp.array(D_pv_hc_np)
         tc_mask_pv_hc = jnp.array(tc_mask_pv_hc_np)
 
+        # --- Per-HC E→E arrays (block-diagonal extraction) ---
+        W_ee_np = np.array(net.W_e_e, dtype=np.float32)
+        D_ee_np = np.array(net.D_ee, dtype=np.int32)
+        mask_ee_np = np.array(net.mask_e_e, dtype=np.float32)
+        ee_pre_np = np.array(net.delay_ee_stdp.pre_trace, dtype=np.float32)
+        ee_post_np = np.array(net.delay_ee_stdp.post_trace, dtype=np.float32)
+        dbuf_ee_np = np.array(net.delay_buf_ee, dtype=np.float32)  # (L_ee, M_total)
+        g_ee_np = np.array(net.g_exc_ee, dtype=np.float32)
+
+        W_ee_hc_np = np.zeros((n_hc, M_per_hc, M_per_hc), dtype=np.float32)
+        D_ee_hc_np = np.zeros((n_hc, M_per_hc, M_per_hc), dtype=np.int32)
+        mask_ee_hc_np = np.zeros((n_hc, M_per_hc, M_per_hc), dtype=np.float32)
+        ee_pre_hc_np = np.zeros((n_hc, M_per_hc, M_per_hc), dtype=np.float32)
+        W_ee_inter_np = np.array(W_ee_np)  # copy for inter-HC extraction
+        for hc in range(n_hc):
+            s_idx, e_idx = hc * M_per_hc, (hc + 1) * M_per_hc
+            W_ee_hc_np[hc] = W_ee_np[s_idx:e_idx, s_idx:e_idx]
+            D_ee_hc_np[hc] = D_ee_np[s_idx:e_idx, s_idx:e_idx]
+            mask_ee_hc_np[hc] = mask_ee_np[s_idx:e_idx, s_idx:e_idx]
+            ee_pre_hc_np[hc] = ee_pre_np[s_idx:e_idx, s_idx:e_idx]
+            # Zero out intra-HC blocks in inter copy
+            W_ee_inter_np[s_idx:e_idx, s_idx:e_idx] = 0.0
+        # delay_buf_ee: (L_ee, M_total) -> (n_hc, L_ee, M_per_hc)
+        L_ee_val = dbuf_ee_np.shape[0]
+        dbuf_ee_hc_np = dbuf_ee_np.T.reshape(n_hc, M_per_hc, L_ee_val).transpose(0, 2, 1)
+        # ee_post_trace: (M_total,) -> (n_hc, M_per_hc)
+        ee_post_hc_np = ee_post_np.reshape(n_hc, M_per_hc)
+        # g_exc_ee: (M_total,) -> (n_hc, M_per_hc)
+        g_ee_hc_np = g_ee_np.reshape(n_hc, M_per_hc)
+
+        W_e_e_hc = jnp.array(W_ee_hc_np)
+        ee_pre_trace_hc = jnp.array(ee_pre_hc_np)
+        ee_post_trace_hc = jnp.array(ee_post_hc_np)
+        delay_buf_ee_hc = jnp.array(dbuf_ee_hc_np)
+        g_exc_ee_hc = jnp.array(g_ee_hc_np)
+        drive_acc_ee_hc = jnp.zeros((n_hc, M_per_hc), dtype=jnp.float32)
+        D_ee_hc = jnp.array(D_ee_hc_np)
+        mask_e_e_hc = jnp.array(mask_ee_hc_np)
+        eye_per_hc = jnp.eye(M_per_hc, dtype=jnp.float32)
+        arange_per_hc = jnp.arange(M_per_hc, dtype=jnp.int32)
+        W_e_e_inter_flat = jnp.array(W_ee_inter_np)
+
+        # --- Per-HC PV/SOM pathway (intra blocks + inter residual) ---
+        n_som_per_hc = net.n_som // n_hc
+
+        # W_e_pv: (n_pv, M) -> intra-HC blocks only (inter-HC PV dropped per validation)
+        W_e_pv_blocks, _ = _extract_diag_blocks(
+            np.array(net.W_e_pv, dtype=np.float32), n_hc, n_pv_per_hc, M_per_hc)
+        W_e_pv_hc = jnp.array(W_e_pv_blocks)
+
+        # W_pv_e: (M, n_pv) -> intra-HC blocks only
+        W_pv_e_blocks, _ = _extract_diag_blocks(
+            np.array(net.W_pv_e, dtype=np.float32), n_hc, M_per_hc, n_pv_per_hc)
+        W_pv_e_hc = jnp.array(W_pv_e_blocks)
+
+        # mask_pv_e: (M, n_pv) -> intra-HC blocks only
+        mask_pv_e_blocks, _ = _extract_diag_blocks(
+            np.array(net.mask_pv_e, dtype=np.float32), n_hc, M_per_hc, n_pv_per_hc)
+        mask_pv_e_hc = jnp.array(mask_pv_e_blocks)
+
+        # SOM skip: skip SOM matmuls when intra-HC SOM weights are zero
+        # (default for multi-HC: w_e_som=0.0, w_som_e=0.0)
+        som_skip = (float(p.w_e_som) == 0.0 and float(p.w_som_e) == 0.0)
+
+        # PV state: reshape (flat) -> (n_hc, per_hc)
+        pv_v_hc = jnp.array(net.pv.v, dtype=jnp.float32).reshape(n_hc, n_pv_per_hc)
+        pv_u_hc = jnp.array(net.pv.u, dtype=jnp.float32).reshape(n_hc, n_pv_per_hc)
+        I_pv_hc = jnp.array(net.I_pv, dtype=jnp.float32).reshape(n_hc, n_pv_per_hc)
+        I_pv_inh_hc = jnp.array(net.I_pv_inh, dtype=jnp.float32).reshape(n_hc, n_pv_per_hc)
+        g_v1_inh_pv_rise_hc = jnp.array(net.g_v1_inh_pv_rise, dtype=jnp.float32).reshape(n_hc, M_per_hc)
+        g_v1_inh_pv_decay_hc = jnp.array(net.g_v1_inh_pv_decay, dtype=jnp.float32).reshape(n_hc, M_per_hc)
+
     else:
         # Placeholders for n_hc=1 (legacy path uses flat arrays)
         _p1 = jnp.zeros((1, 1), dtype=jnp.float32)
@@ -502,6 +630,30 @@ def numpy_net_to_jax_state(net) -> Tuple[SimState, StaticConfig]:
         D_pv_hc = _p2i
         tc_mask_pv_hc = _p2
         n_pv_per_hc = int(p.M * p.n_pv_per_ensemble)
+        n_som_per_hc = int(p.M * p.n_som_per_ensemble)
+        # PV per-HC placeholders
+        W_e_pv_hc = _p2
+        W_pv_e_hc = _p2
+        mask_pv_e_hc = _p2
+        som_skip = False  # n_hc=1 always uses flat SOM path
+        pv_v_hc = _p1
+        pv_u_hc = _p1
+        I_pv_hc = _p1
+        I_pv_inh_hc = _p1
+        g_v1_inh_pv_rise_hc = _p1
+        g_v1_inh_pv_decay_hc = _p1
+        # E→E per-HC placeholders
+        W_e_e_hc = _p2
+        ee_pre_trace_hc = _p2
+        ee_post_trace_hc = _p1
+        delay_buf_ee_hc = _p2
+        g_exc_ee_hc = _p1
+        drive_acc_ee_hc = _p1
+        D_ee_hc = _p2i
+        mask_e_e_hc = _p2
+        eye_per_hc = _p1
+        arange_per_hc = jnp.zeros(1, dtype=jnp.int32)
+        W_e_e_inter_flat = jnp.zeros((1, 1), dtype=jnp.float32)
 
     state = SimState(
         lgn_v=jnp.array(net.lgn.v, dtype=jnp.float32),
@@ -559,6 +711,21 @@ def numpy_net_to_jax_state(net) -> Tuple[SimState, StaticConfig]:
         rate_avg_hc=rate_avg_hc,
         I_v1_bias_hc=I_v1_bias_hc,
         pv_istdp_x_post_hc=pv_istdp_x_post_hc,
+        # Per-HC PV batched state
+        pv_v_hc=pv_v_hc,
+        pv_u_hc=pv_u_hc,
+        I_pv_hc=I_pv_hc,
+        I_pv_inh_hc=I_pv_inh_hc,
+        g_v1_inh_pv_rise_hc=g_v1_inh_pv_rise_hc,
+        g_v1_inh_pv_decay_hc=g_v1_inh_pv_decay_hc,
+        W_pv_e_hc=W_pv_e_hc,
+        # Per-HC E→E batched state
+        W_e_e_hc=W_e_e_hc,
+        ee_pre_trace_hc=ee_pre_trace_hc,
+        ee_post_trace_hc=ee_post_trace_hc,
+        delay_buf_ee_hc=delay_buf_ee_hc,
+        g_exc_ee_hc=g_exc_ee_hc,
+        drive_acc_ee_hc=drive_acc_ee_hc,
     )
 
     static = StaticConfig(
@@ -687,6 +854,18 @@ def numpy_net_to_jax_state(net) -> Tuple[SimState, StaticConfig]:
         D_pv_hc=D_pv_hc,
         tc_mask_pv_hc=tc_mask_pv_hc,
         n_pv_per_hc=int(n_pv_per_hc),
+        # Per-HC PV static arrays (block-diagonal only)
+        W_e_pv_hc=W_e_pv_hc,
+        W_pv_e_hc=W_pv_e_hc,
+        mask_pv_e_hc=mask_pv_e_hc,
+        n_som_per_hc=int(n_som_per_hc),
+        som_skip=som_skip,
+        # Per-HC E→E static arrays
+        D_ee_hc=D_ee_hc,
+        mask_e_e_hc=mask_e_e_hc,
+        eye_per_hc=eye_per_hc,
+        arange_per_hc=arange_per_hc,
+        W_e_e_inter_flat=W_e_e_inter_flat,
     )
 
     return state, static
@@ -742,8 +921,16 @@ def _flatten_per_hc_delay_buf(hc_buf, n_hc, n_pix_per_hc, n_pix_total):
     return result
 
 
-def jax_state_to_numpy_net(state: SimState, net) -> None:
-    """Write JAX SimState back into the corresponding numpy RgcLgnV1Network (in-place)."""
+def jax_state_to_numpy_net(state: SimState, net, static: StaticConfig = None) -> None:
+    """Write JAX SimState back into the corresponding numpy RgcLgnV1Network (in-place).
+
+    Parameters
+    ----------
+    state : SimState
+    net : RgcLgnV1Network (numpy)
+    static : StaticConfig, optional
+        Required for n_hc > 1 to reconstruct flat W_e_e from per-HC blocks.
+    """
     n_hc = getattr(net, 'n_hc', 1)
     n_pix_per_hc = getattr(net, 'n_pix_per_hc', net.p.N * net.p.N)
     M_per_hc = getattr(net, 'M_per_hc', net.p.M)
@@ -790,29 +977,50 @@ def jax_state_to_numpy_net(state: SimState, net) -> None:
         net.stdp.x_pre = np.array(state.stdp_x_pre, dtype=np.float32)
         net.stdp.x_pre_slow = np.array(state.stdp_x_pre_slow, dtype=np.float32)
 
-    # V1/PV/SOM states (always flat)
+    # V1 state (always flat)
     net.v1_exc.v = np.array(state.v1_v, dtype=np.float32)
     net.v1_exc.u = np.array(state.v1_u, dtype=np.float32)
-    net.pv.v = np.array(state.pv_v, dtype=np.float32)
-    net.pv.u = np.array(state.pv_u, dtype=np.float32)
-    net.som.v = np.array(state.som_v, dtype=np.float32)
-    net.som.u = np.array(state.som_u, dtype=np.float32)
+
+    if n_hc > 1:
+        # PV state from per-HC arrays
+        net.pv.v = np.array(state.pv_v_hc, dtype=np.float32).reshape(-1)
+        net.pv.u = np.array(state.pv_u_hc, dtype=np.float32).reshape(-1)
+        net.I_pv = np.array(state.I_pv_hc, dtype=np.float32).reshape(-1)
+        net.I_pv_inh = np.array(state.I_pv_inh_hc, dtype=np.float32).reshape(-1)
+        net.g_v1_inh_pv_rise = np.array(state.g_v1_inh_pv_rise_hc, dtype=np.float32).reshape(-1)
+        net.g_v1_inh_pv_decay = np.array(state.g_v1_inh_pv_decay_hc, dtype=np.float32).reshape(-1)
+        # SOM state from flat arrays (SOM skipped or handled flat for multi-HC)
+        net.som.v = np.array(state.som_v, dtype=np.float32)
+        net.som.u = np.array(state.som_u, dtype=np.float32)
+        net.I_som = np.array(state.I_som, dtype=np.float32)
+        net.I_som_inh = np.array(state.I_som_inh, dtype=np.float32)
+        net.g_v1_inh_som = np.array(state.g_v1_inh_som, dtype=np.float32)
+    else:
+        net.pv.v = np.array(state.pv_v, dtype=np.float32)
+        net.pv.u = np.array(state.pv_u, dtype=np.float32)
+        net.som.v = np.array(state.som_v, dtype=np.float32)
+        net.som.u = np.array(state.som_u, dtype=np.float32)
+        net.I_pv = np.array(state.I_pv, dtype=np.float32)
+        net.I_pv_inh = np.array(state.I_pv_inh, dtype=np.float32)
+        net.I_som = np.array(state.I_som, dtype=np.float32)
+        net.I_som_inh = np.array(state.I_som_inh, dtype=np.float32)
+        net.g_v1_inh_pv_rise = np.array(state.g_v1_inh_pv_rise, dtype=np.float32)
+        net.g_v1_inh_pv_decay = np.array(state.g_v1_inh_pv_decay, dtype=np.float32)
+        net.g_v1_inh_som = np.array(state.g_v1_inh_som, dtype=np.float32)
 
     # Synaptic / conductance state (flat)
     net.g_exc_ff = np.array(state.g_exc_ff, dtype=np.float32)
     net.g_exc_ee = np.array(state.g_exc_ee, dtype=np.float32)
-    net.g_v1_inh_pv_rise = np.array(state.g_v1_inh_pv_rise, dtype=np.float32)
-    net.g_v1_inh_pv_decay = np.array(state.g_v1_inh_pv_decay, dtype=np.float32)
-    net.g_v1_inh_som = np.array(state.g_v1_inh_som, dtype=np.float32)
     net.g_v1_apical = np.array(state.g_v1_apical, dtype=np.float32)
-    net.I_pv = np.array(state.I_pv, dtype=np.float32)
-    net.I_pv_inh = np.array(state.I_pv_inh, dtype=np.float32)
-    net.I_som = np.array(state.I_som, dtype=np.float32)
-    net.I_som_inh = np.array(state.I_som_inh, dtype=np.float32)
 
     # Delay buffers (flat / EE)
     net.ptr = int(state.ptr)
-    net.delay_buf_ee = np.array(state.delay_buf_ee, dtype=np.uint8)
+    if n_hc > 1:
+        # Reconstruct flat delay_buf_ee from per-HC: (n_hc, L_ee, M_per_hc) -> (L_ee, M_total)
+        dbuf_hc_np = np.array(state.delay_buf_ee_hc, dtype=np.float32)  # (n_hc, L_ee, M_per_hc)
+        net.delay_buf_ee = dbuf_hc_np.transpose(1, 0, 2).reshape(dbuf_hc_np.shape[1], -1).astype(np.uint8)
+    else:
+        net.delay_buf_ee = np.array(state.delay_buf_ee, dtype=np.uint8)
     net.ptr_ee = int(state.ptr_ee)
 
     if n_hc <= 1:
@@ -825,12 +1033,36 @@ def jax_state_to_numpy_net(state: SimState, net) -> None:
     # else: already set from per-HC arrays above
 
     # E→E delay-aware STDP traces
-    net.delay_ee_stdp.pre_trace = np.array(state.ee_pre_trace, dtype=np.float32)
-    net.delay_ee_stdp.post_trace = np.array(state.ee_post_trace, dtype=np.float32)
+    if n_hc > 1:
+        # Reconstruct flat traces from per-HC blocks
+        ee_pre_hc_np = np.array(state.ee_pre_trace_hc, dtype=np.float32)
+        M = net.M
+        net.delay_ee_stdp.pre_trace = np.zeros((M, M), dtype=np.float32)
+        for hc in range(n_hc):
+            s_idx = hc * M_per_hc
+            net.delay_ee_stdp.pre_trace[s_idx:s_idx + M_per_hc, s_idx:s_idx + M_per_hc] = ee_pre_hc_np[hc]
+        net.delay_ee_stdp.post_trace = np.array(state.ee_post_trace_hc, dtype=np.float32).reshape(-1)
+    else:
+        net.delay_ee_stdp.pre_trace = np.array(state.ee_pre_trace, dtype=np.float32)
+        net.delay_ee_stdp.post_trace = np.array(state.ee_post_trace, dtype=np.float32)
 
-    # Weights (flat for PV/EE)
-    net.W_pv_e = np.array(state.W_pv_e, dtype=np.float32)
-    net.W_e_e = np.array(state.W_e_e, dtype=np.float32)
+    # Weights (PV/EE)
+    if n_hc > 1 and static is not None:
+        # Reconstruct flat W_pv_e from per-HC blocks (block-diagonal only)
+        W_pv_e_hc_np = np.array(state.W_pv_e_hc, dtype=np.float32)
+        n_pv_per_hc = W_pv_e_hc_np.shape[2]
+        W_pv_e_flat = np.zeros((n_hc * M_per_hc, n_hc * n_pv_per_hc), dtype=np.float32)
+        for hc in range(n_hc):
+            r_s = hc * M_per_hc
+            c_s = hc * n_pv_per_hc
+            W_pv_e_flat[r_s:r_s + M_per_hc, c_s:c_s + n_pv_per_hc] = W_pv_e_hc_np[hc]
+        net.W_pv_e = W_pv_e_flat
+    else:
+        net.W_pv_e = np.array(state.W_pv_e, dtype=np.float32)
+    if n_hc > 1 and static is not None:
+        net.W_e_e = get_flat_W_e_e_numpy(state, static)
+    else:
+        net.W_e_e = np.array(state.W_e_e, dtype=np.float32)
 
     # Previous spikes
     net.prev_v1_spk = np.array(state.prev_v1_spk, dtype=np.uint8)
@@ -1239,6 +1471,29 @@ def triplet_stdp_update(stdp_x_pre, stdp_x_pre_slow, stdp_x_post, stdp_x_post_sl
     return x_pre, x_pre_slow, x_post, x_post_slow, dW
 
 
+def _reconstruct_flat_from_hc_blocks(hc_blocks, n_hc, rows_per_hc, cols_per_hc):
+    """Reconstruct flat (n_rows_total, n_cols_total) from diagonal blocks (JAX-compatible).
+
+    Parameters
+    ----------
+    hc_blocks : (n_hc, rows_per_hc, cols_per_hc) — diagonal blocks
+    n_hc : int
+    rows_per_hc, cols_per_hc : int
+
+    Returns
+    -------
+    (n_rows_total, n_cols_total) — block-diagonal matrix
+    """
+    rows_total = n_hc * rows_per_hc
+    cols_total = n_hc * cols_per_hc
+    result = jnp.zeros((rows_total, cols_total), dtype=hc_blocks.dtype)
+    for hc in range(n_hc):
+        r_s = hc * rows_per_hc
+        c_s = hc * cols_per_hc
+        result = result.at[r_s:r_s + rows_per_hc, c_s:c_s + cols_per_hc].set(hc_blocks[hc])
+    return result
+
+
 def pv_istdp_update(x_post, pv_spk, v1_spk, W_pv_e, mask_pv_e,
                     decay, eta, rho, w_max):
     """PV inhibitory plasticity update (pure functional).
@@ -1256,6 +1511,75 @@ def pv_istdp_update(x_post, pv_spk, v1_spk, W_pv_e, mask_pv_e,
     W_pv_e_new = jnp.clip(W_pv_e + dW, 0.0, w_max)
 
     return x_post_new, W_pv_e_new
+
+
+def per_hc_pv_step(
+    prev_v1_spk_hc,
+    pv_v_hc, pv_u_hc, I_pv_hc, I_pv_inh_hc, I_pv_lgn_hc,
+    g_v1_inh_pv_rise_hc, g_v1_inh_pv_decay_hc,
+    W_e_pv_hc, W_pv_e_hc,
+    decay_ampa, decay_gaba, decay_gaba_rise_pv,
+    pv_a, pv_b, pv_c, pv_d, pv_v_peak, dt_ms,
+):
+    """Intra-HC PV step for one hypercolumn (designed for vmap).
+
+    Runs BEFORE V1 integration — PV→E conductance feeds into V1.
+
+    Parameters
+    ----------
+    prev_v1_spk_hc : (M_per_hc,) — previous-step V1 spikes (drives E→PV)
+    pv_v_hc, pv_u_hc : (n_pv_per_hc,) — PV membrane state
+    I_pv_hc, I_pv_inh_hc : (n_pv_per_hc,) — PV currents (pre-decay)
+    I_pv_lgn_hc : (n_pv_per_hc,) — PV LGN drive (from feedforward vmap)
+    g_v1_inh_pv_rise_hc, g_v1_inh_pv_decay_hc : (M_per_hc,) — PV conductances
+    W_e_pv_hc : (n_pv_per_hc, M_per_hc) — intra-HC E→PV weights
+    W_pv_e_hc : (M_per_hc, n_pv_per_hc) — intra-HC PV→E weights
+
+    Returns
+    -------
+    (pv_v, pv_u, pv_spk, I_pv, I_pv_inh,
+     g_v1_inh_pv_rise, g_v1_inh_pv_decay)
+    """
+    I_pv_new = I_pv_hc * decay_ampa + I_pv_lgn_hc
+    I_pv_inh_new = I_pv_inh_hc * decay_gaba
+    I_pv_new = I_pv_new + W_e_pv_hc @ prev_v1_spk_hc  # (n_pv_per_hc,)
+    pv_v_new, pv_u_new, pv_spk = izh_step(
+        pv_v_hc, pv_u_hc, I_pv_new - I_pv_inh_new,
+        pv_a, pv_b, pv_c, pv_d, pv_v_peak, dt_ms)
+    g_pv_inc = W_pv_e_hc @ pv_spk  # (M_per_hc,)
+    g_v1_inh_pv_rise_new = g_v1_inh_pv_rise_hc * decay_gaba_rise_pv + g_pv_inc
+    g_v1_inh_pv_decay_new = g_v1_inh_pv_decay_hc * decay_gaba + g_pv_inc
+    return (pv_v_new, pv_u_new, pv_spk, I_pv_new, I_pv_inh_new,
+            g_v1_inh_pv_rise_new, g_v1_inh_pv_decay_new)
+
+
+
+def per_hc_ee_step(D_hc, buf_hc, ptr_ee, arange_hc, eye_hc, W_hc, L_ee, decay_ampa, w_exc_gain, g_exc_ee_hc):
+    """Compute E→E current for a single hypercolumn (designed for vmap).
+
+    Parameters
+    ----------
+    D_hc : (M_per_hc, M_per_hc) int32 — per-HC delays
+    buf_hc : (L_ee, M_per_hc) — per-HC spike ring buffer
+    ptr_ee : int32 scalar — current write pointer
+    arange_hc : (M_per_hc,) int32
+    eye_hc : (M_per_hc, M_per_hc) — identity for diagonal zeroing
+    W_hc : (M_per_hc, M_per_hc) — per-HC E→E weights
+    L_ee : int — delay buffer length
+    decay_ampa : float
+    w_exc_gain : float
+    g_exc_ee_hc : (M_per_hc,) — previous E→E conductance
+
+    Returns
+    -------
+    (g_exc_ee_new, arrivals) — updated conductance and arrival matrix
+    """
+    idx = (ptr_ee - D_hc) % L_ee  # (M_per_hc, M_per_hc)
+    arrivals = buf_hc[idx, arange_hc[None, :]]  # (M_per_hc, M_per_hc)
+    arrivals = arrivals * (1.0 - eye_hc)
+    I_ee = (W_hc * arrivals).sum(axis=1)  # (M_per_hc,)
+    g_exc_ee_new = g_exc_ee_hc * decay_ampa + w_exc_gain * I_ee
+    return g_exc_ee_new, arrivals
 
 
 def timestep(state, static, t_ms, theta_deg, phase, contrast, step_key):
@@ -1401,13 +1725,28 @@ def timestep(state, static, t_ms, theta_deg, phase, contrast, step_key):
     # --- V1 excitatory conductances ---
     g_exc_ff = state.g_exc_ff * s.decay_ampa + s.w_exc_gain * I_ff
 
-    # --- Flat E→E path (GPU-trivial for all n_hc values) ---
-    g_exc_ee = state.g_exc_ee * s.decay_ampa
-    ee_idx = (state.ptr_ee - s.D_ee) % s.L_ee  # (M, M)
-    ee_arrivals = state.delay_buf_ee[ee_idx, s.arange_M[None, :]]  # (M, M)
-    ee_arrivals = ee_arrivals * (1.0 - s.eye_M)
-    I_ee = (state.W_e_e * ee_arrivals).sum(axis=1)
-    g_exc_ee = g_exc_ee + s.w_exc_gain * I_ee
+    # --- E→E path ---
+    if s.n_hc > 1:
+        # Per-HC vmapped E→E computation (block-diagonal, O(M_per_hc²) per HC)
+        ee_step_vmap = jax.vmap(
+            per_hc_ee_step,
+            in_axes=(0, 0, None, None, None, 0, None, None, None, 0))
+        g_exc_ee_hc, ee_arrivals_hc = ee_step_vmap(
+            s.D_ee_hc, state.delay_buf_ee_hc, state.ptr_ee,
+            s.arange_per_hc, s.eye_per_hc, state.W_e_e_hc,
+            s.L_ee, s.decay_ampa, s.w_exc_gain, state.g_exc_ee_hc)
+        g_exc_ee = g_exc_ee_hc.reshape(-1)  # (n_hc, M_per_hc) -> (M_total,)
+        ee_arrivals = ee_arrivals_hc  # (n_hc, M_per_hc, M_per_hc) for STDP
+    else:
+        # Legacy flat path (unchanged for n_hc=1)
+        g_exc_ee = state.g_exc_ee * s.decay_ampa
+        ee_idx = (state.ptr_ee - s.D_ee) % s.L_ee  # (M, M)
+        ee_arrivals = state.delay_buf_ee[ee_idx, s.arange_M[None, :]]  # (M, M)
+        ee_arrivals = ee_arrivals * (1.0 - s.eye_M)
+        I_ee = (state.W_e_e * ee_arrivals).sum(axis=1)
+        g_exc_ee = g_exc_ee + s.w_exc_gain * I_ee
+        ee_arrivals_hc = ee_arrivals  # flat (M, M) for n_hc=1
+        g_exc_ee_hc = state.g_exc_ee_hc  # placeholder unchanged
 
     # Drive accumulators
     drive_acc_ff = state.drive_acc_ff + g_exc_ff
@@ -1417,62 +1756,133 @@ def timestep(state, static, t_ms, theta_deg, phase, contrast, step_key):
     # Apical conductance decay (no external apical drive in grating path)
     g_v1_apical = state.g_v1_apical * s.decay_apical
 
-    # --- Inhibitory conductances (GABA decay) ---
-    g_v1_inh_pv_rise = state.g_v1_inh_pv_rise * s.decay_gaba_rise_pv
-    g_v1_inh_pv_decay = state.g_v1_inh_pv_decay * s.decay_gaba
-    g_v1_inh_som = state.g_v1_inh_som * s.decay_gaba
-
-    # --- PV interneurons (feedforward inhibition; runs BEFORE E) ---
-    I_pv = state.I_pv * s.decay_ampa
-    I_pv_inh = state.I_pv_inh * s.decay_gaba
-
     if s.n_hc > 1:
-        # Per-HC PV LGN drive was computed earlier via vmap (I_pv_lgn)
-        I_pv = I_pv + I_pv_lgn
+        # ===== Multi-HC vmapped PV → V1 → SOM path =====
+        # Reshape flat vectors to per-HC for vmap
+        prev_v1_spk_hc = state.prev_v1_spk.reshape(s.n_hc, s.M_per_hc)
+
+        # --- PV step (vmapped over HC) ---
+        pv_vmap = jax.vmap(
+            per_hc_pv_step,
+            in_axes=(0,
+                     0, 0, 0, 0, 0,
+                     0, 0,
+                     0, 0,
+                     None, None, None,
+                     None, None, None, None, None, None))
+        (pv_v_hc, pv_u_hc, pv_spk_hc, I_pv_hc, I_pv_inh_hc,
+         g_v1_inh_pv_rise_hc, g_v1_inh_pv_decay_hc) = pv_vmap(
+            prev_v1_spk_hc,
+            state.pv_v_hc, state.pv_u_hc, state.I_pv_hc, state.I_pv_inh_hc,
+            I_pv_lgn_hc,  # from feedforward vmap (n_hc, n_pv_per_hc)
+            state.g_v1_inh_pv_rise_hc, state.g_v1_inh_pv_decay_hc,
+            s.W_e_pv_hc, state.W_pv_e_hc,
+            s.decay_ampa, s.decay_gaba, s.decay_gaba_rise_pv,
+            s.pv_a, s.pv_b, s.pv_c, s.pv_d, s.pv_v_peak, s.dt_ms)
+
+        # Flatten PV state (block-diagonal only — inter-HC PV dropped per validation)
+        pv_v = pv_v_hc.reshape(-1)
+        pv_u = pv_u_hc.reshape(-1)
+        pv_spk = pv_spk_hc.reshape(-1)
+        I_pv = I_pv_hc.reshape(-1)
+        I_pv_inh = I_pv_inh_hc.reshape(-1)
+        g_v1_inh_pv_rise = g_v1_inh_pv_rise_hc.reshape(-1)
+        g_v1_inh_pv_decay = g_v1_inh_pv_decay_hc.reshape(-1)
+
+        # --- V1 integration (flat) ---
+        g_v1_inh_som = state.g_v1_inh_som * s.decay_gaba  # SOM from previous step
+        g_pv = jnp.clip(g_v1_inh_pv_decay - g_v1_inh_pv_rise, 0.0, None)
+        g_inh = g_pv + g_v1_inh_som
+        g_v1_exc = g_exc_ff + g_exc_ee
+        I_exc = g_v1_exc * (s.E_exc - state.v1_v)
+        I_v1_total = I_exc + g_inh * (s.E_inh - state.v1_v) + state.I_v1_bias
+
+        v1_v, v1_u, v1_spk = izh_step(
+            state.v1_v, state.v1_u, I_v1_total,
+            s.v1_a, s.v1_b, s.v1_c, s.v1_d, s.v1_v_peak, s.dt_ms)
+
+        # --- SOM step ---
+        if s.som_skip:
+            # SOM skipped (w_e_som=0, w_som_e=0): zero input, zero spikes, just decay
+            som_spk = jnp.zeros(s.n_som, dtype=jnp.float32)
+            som_v = state.som_v
+            som_u = state.som_u
+            I_som = state.I_som * s.decay_ampa
+            I_som_inh = state.I_som_inh * s.decay_gaba
+            # g_v1_inh_som already decayed above
+        else:
+            # Flat SOM path (rare: nonzero w_e_som/w_som_e with n_hc > 1)
+            I_som = state.I_som * s.decay_ampa
+            I_som_inh = state.I_som_inh * s.decay_gaba
+            I_som = I_som + s.W_e_som @ v1_spk
+            som_v, som_u, som_spk = izh_step(
+                state.som_v, state.som_u, I_som - I_som_inh,
+                s.som_a, s.som_b, s.som_c, s.som_d, s.som_v_peak, s.dt_ms)
+            g_v1_inh_som = g_v1_inh_som + s.W_som_e @ som_spk
+
     else:
-        # Legacy flat PV LGN pathway
+        # ===== Legacy single-HC path (UNCHANGED) =====
+        # Inhibitory conductances (GABA decay)
+        g_v1_inh_pv_rise = state.g_v1_inh_pv_rise * s.decay_gaba_rise_pv
+        g_v1_inh_pv_decay = state.g_v1_inh_pv_decay * s.decay_gaba
+        g_v1_inh_som = state.g_v1_inh_som * s.decay_gaba
+
+        # PV interneurons
+        I_pv = state.I_pv * s.decay_ampa
+        I_pv_inh = state.I_pv_inh * s.decay_gaba
         idx_pv = (state.ptr - s.D_pv) % s.L
-        arrivals_pv = delay_buf[idx_pv, s.arange_lgn[None, :]]  # (n_pv, n_lgn)
+        arrivals_pv = delay_buf[idx_pv, s.arange_lgn[None, :]]
         arrivals_pv_tc = arrivals_pv * s.tc_mask_pv_f32
         I_pv = I_pv + s.w_lgn_pv_gain * (s.W_lgn_pv * arrivals_pv_tc).sum(axis=1)
+        I_pv = I_pv + s.W_e_pv @ state.prev_v1_spk
+        pv_v, pv_u, pv_spk = izh_step(
+            state.pv_v, state.pv_u, I_pv - I_pv_inh,
+            s.pv_a, s.pv_b, s.pv_c, s.pv_d, s.pv_v_peak, s.dt_ms)
+        g_pv_inc = state.W_pv_e @ pv_spk
+        g_v1_inh_pv_rise = g_v1_inh_pv_rise + g_pv_inc
+        g_v1_inh_pv_decay = g_v1_inh_pv_decay + g_pv_inc
 
-    # Local recurrent E->PV (delayed by one step)
-    I_pv = I_pv + s.W_e_pv @ state.prev_v1_spk
+        # V1 excitatory integration
+        g_pv = jnp.clip(g_v1_inh_pv_decay - g_v1_inh_pv_rise, 0.0, None)
+        g_inh = g_pv + g_v1_inh_som
+        g_v1_exc = g_exc_ff + g_exc_ee
+        I_exc = g_v1_exc * (s.E_exc - state.v1_v)
+        I_v1_total = I_exc + g_inh * (s.E_inh - state.v1_v) + state.I_v1_bias
+        v1_v, v1_u, v1_spk = izh_step(
+            state.v1_v, state.v1_u, I_v1_total,
+            s.v1_a, s.v1_b, s.v1_c, s.v1_d, s.v1_v_peak, s.dt_ms)
 
-    # PV step
-    pv_v, pv_u, pv_spk = izh_step(
-        state.pv_v, state.pv_u, I_pv - I_pv_inh,
-        s.pv_a, s.pv_b, s.pv_c, s.pv_d, s.pv_v_peak, s.dt_ms)
+        # SOM interneurons
+        I_som = state.I_som * s.decay_ampa
+        I_som_inh = state.I_som_inh * s.decay_gaba
+        I_som = I_som + s.W_e_som @ v1_spk
+        som_v, som_u, som_spk = izh_step(
+            state.som_v, state.som_u, I_som - I_som_inh,
+            s.som_a, s.som_b, s.som_c, s.som_d, s.som_v_peak, s.dt_ms)
+        g_v1_inh_som = g_v1_inh_som + s.W_som_e @ som_spk
 
-    # PV->E inhibition (GABA conductance increment with rise time)
-    g_pv_inc = state.W_pv_e @ pv_spk  # (M,)
-    g_v1_inh_pv_rise = g_v1_inh_pv_rise + g_pv_inc
-    g_v1_inh_pv_decay = g_v1_inh_pv_decay + g_pv_inc
+        # Apical conductance decay
+        g_v1_apical = state.g_v1_apical * s.decay_apical
 
-    # --- V1 excitatory integration (conductance-based) ---
-    g_pv = jnp.clip(g_v1_inh_pv_decay - g_v1_inh_pv_rise, 0.0, None)
-    g_inh = g_pv + g_v1_inh_som
-    g_v1_exc = g_exc_ff + g_exc_ee
-    I_exc = g_v1_exc * (s.E_exc - state.v1_v)
-    I_v1_total = I_exc + g_inh * (s.E_inh - state.v1_v) + state.I_v1_bias
+        # Per-HC PV placeholders (unchanged)
+        pv_v_hc = state.pv_v_hc
+        pv_u_hc = state.pv_u_hc
+        I_pv_hc = state.I_pv_hc
+        I_pv_inh_hc = state.I_pv_inh_hc
+        g_v1_inh_pv_rise_hc = state.g_v1_inh_pv_rise_hc
+        g_v1_inh_pv_decay_hc = state.g_v1_inh_pv_decay_hc
 
-    v1_v, v1_u, v1_spk = izh_step(
-        state.v1_v, state.v1_u, I_v1_total,
-        s.v1_a, s.v1_b, s.v1_c, s.v1_d, s.v1_v_peak, s.dt_ms)
-
-    # --- SOM interneurons (lateral inhibition; updated AFTER E, affects next step) ---
-    I_som = state.I_som * s.decay_ampa
-    I_som_inh = state.I_som_inh * s.decay_gaba
-    I_som = I_som + s.W_e_som @ v1_spk
-    som_v, som_u, som_spk = izh_step(
-        state.som_v, state.som_u, I_som - I_som_inh,
-        s.som_a, s.som_b, s.som_c, s.som_d, s.som_v_peak, s.dt_ms)
-
-    # SOM->E lateral inhibition (GABA conductance increment; affects next step)
-    g_v1_inh_som = g_v1_inh_som + s.W_som_e @ som_spk
-
-    # --- Write V1 E spikes into flat E->E delay buffer (all n_hc) ---
-    delay_buf_ee = state.delay_buf_ee.at[state.ptr_ee, :].set(v1_spk)
+    # --- Write V1 E spikes into E→E delay buffer ---
+    if s.n_hc > 1:
+        # Per-HC delay buffer write: (n_hc, L_ee, M_per_hc)
+        v1_spk_hc_ee = v1_spk.reshape(s.n_hc, s.M_per_hc)
+        delay_buf_ee_hc = state.delay_buf_ee_hc.at[:, state.ptr_ee, :].set(v1_spk_hc_ee)
+        delay_buf_ee = state.delay_buf_ee  # keep flat buffer stale (unused for n_hc>1 timestep)
+        drive_acc_ee_hc_new = state.drive_acc_ee_hc + g_exc_ee_hc
+    else:
+        delay_buf_ee = state.delay_buf_ee.at[state.ptr_ee, :].set(v1_spk)
+        delay_buf_ee_hc = state.delay_buf_ee_hc  # placeholder unchanged
+        drive_acc_ee_hc_new = state.drive_acc_ee_hc  # placeholder unchanged
 
     # --- Update delay buffer pointers ---
     ptr = (state.ptr + 1) % s.L
@@ -1514,6 +1924,17 @@ def timestep(state, static, t_ms, theta_deg, phase, contrast, step_key):
         I_lgn_hc=I_lgn_hc,
         lgn_rgc_drive_hc=lgn_rgc_drive_hc,
         delay_buf_hc=delay_buf_hc,
+        # Per-HC PV batched state
+        pv_v_hc=pv_v_hc,
+        pv_u_hc=pv_u_hc,
+        I_pv_hc=I_pv_hc,
+        I_pv_inh_hc=I_pv_inh_hc,
+        g_v1_inh_pv_rise_hc=g_v1_inh_pv_rise_hc,
+        g_v1_inh_pv_decay_hc=g_v1_inh_pv_decay_hc,
+        # Per-HC E→E batched state
+        g_exc_ee_hc=g_exc_ee_hc,
+        delay_buf_ee_hc=delay_buf_ee_hc,
+        drive_acc_ee_hc=drive_acc_ee_hc_new,
     )
 
     return new_state, v1_spk, arrivals_tc, pv_spk, ee_arrivals, arrivals_tc_hc
@@ -1596,11 +2017,30 @@ def timestep_plastic(state, static, t_ms, theta_deg, phase, contrast, step_key):
         rate_avg_hc_new = new_state.rate_avg_hc
         pv_istdp_x_post_hc_new = new_state.pv_istdp_x_post_hc
 
-    # --- PV iSTDP (flat — PV connects across HCs) ---
-    pv_istdp_x_post_new, W_pv_e_new = pv_istdp_update(
-        new_state.pv_istdp_x_post, pv_spk, v1_spk,
-        new_state.W_pv_e, s.mask_pv_e,
-        s.pv_istdp_decay, s.pv_istdp_eta, s.pv_istdp_rho, s.w_pv_e_max)
+    if s.n_hc > 1:
+        # --- Per-HC PV iSTDP (vmapped over intra-HC blocks) ---
+        pv_spk_hc = pv_spk.reshape(s.n_hc, s.n_pv_per_hc)
+        pv_istdp_vmap = jax.vmap(
+            pv_istdp_update,
+            in_axes=(0, 0, 0, 0, 0,
+                     None, None, None, None))
+        pv_istdp_x_post_hc_new2, W_pv_e_hc_new = pv_istdp_vmap(
+            new_state.pv_istdp_x_post_hc, pv_spk_hc, v1_spk_hc,
+            new_state.W_pv_e_hc, s.mask_pv_e_hc,
+            s.pv_istdp_decay, s.pv_istdp_eta, s.pv_istdp_rho, s.w_pv_e_max)
+        # Flatten post trace for flat state
+        pv_istdp_x_post_new = pv_istdp_x_post_hc_new2.reshape(-1)
+        # Keep flat W_pv_e stale — only per-HC blocks are used in hot path
+        W_pv_e_new = new_state.W_pv_e  # stale (reconstructed at segment boundary)
+        # Use the per-HC iSTDP post trace (overrides the one from the PV step)
+        pv_istdp_x_post_hc_new = pv_istdp_x_post_hc_new2
+    else:
+        # --- PV iSTDP (flat — legacy path) ---
+        pv_istdp_x_post_new, W_pv_e_new = pv_istdp_update(
+            new_state.pv_istdp_x_post, pv_spk, v1_spk,
+            new_state.W_pv_e, s.mask_pv_e,
+            s.pv_istdp_decay, s.pv_istdp_eta, s.pv_istdp_rho, s.w_pv_e_max)
+        W_pv_e_hc_new = new_state.W_pv_e_hc  # placeholder unchanged
 
     # --- Homeostatic rate estimate (EMA) ---
     instant_rate = v1_spk * (1000.0 / s.dt_ms)
@@ -1623,6 +2063,7 @@ def timestep_plastic(state, static, t_ms, theta_deg, phase, contrast, step_key):
         stdp_x_post_slow_hc=x_post_slow_hc,
         rate_avg_hc=rate_avg_hc_new,
         pv_istdp_x_post_hc=pv_istdp_x_post_hc_new,
+        W_pv_e_hc=W_pv_e_hc_new,
     )
 
     return new_state, v1_spk
@@ -1730,38 +2171,60 @@ def timestep_phaseb_plastic(state, static, t_ms, theta_deg, phase, contrast, ste
     new_state, v1_spk, _arrivals_tc, _pv_spk, ee_arrivals, _arrivals_tc_hc = timestep(
         state, static, t_ms, theta_deg, phase, contrast, step_key)
 
-    # --- Flat E→E STDP (used for all n_hc values) ---
-    # Build per-synapse STDP ceiling: intra-HC and inter-HC populations have
-    # different maximum synaptic efficacy (Bosking 1997, McGuire 1991).
-    if s.n_hc > 1:
-        w_max_matrix = (s.w_e_e_max * s.intra_hc_mask
-                        + s.w_e_e_max_inter * (1.0 - s.intra_hc_mask) * (1.0 - s.eye_M))
-    else:
-        w_max_matrix = s.w_e_e_max  # scalar broadcast
-
-    pre_trace, post_trace, dW_ee = delay_aware_ee_stdp_update(
-        new_state.ee_pre_trace, new_state.ee_post_trace,
-        ee_arrivals, v1_spk,
-        new_state.W_e_e, s.mask_e_e,
-        s.ee_stdp_decay_pre, s.ee_stdp_decay_post,
-        ee_A_plus_eff, ee_A_minus_eff,
-        s.w_e_e_min, w_max_matrix,
-        s.ee_stdp_weight_dep)
-
-    W_e_e_new = new_state.W_e_e + dW_ee
-    W_e_e_new = jnp.clip(W_e_e_new, s.w_e_e_min, w_max_matrix)
-    W_e_e_new = W_e_e_new * (1.0 - s.eye_M)  # zero diagonal
-
-    # Homeostatic rate estimate
+    # Homeostatic rate estimate (common to both paths)
     instant_rate = v1_spk * (1000.0 / s.dt_ms)
     rate_avg_new = s.homeostasis_decay * new_state.rate_avg + (1.0 - s.homeostasis_decay) * instant_rate
 
-    return new_state._replace(
-        ee_pre_trace=pre_trace,
-        ee_post_trace=post_trace,
-        W_e_e=W_e_e_new,
-        rate_avg=rate_avg_new,
-    ), v1_spk
+    if s.n_hc > 1:
+        # --- Per-HC vmapped E→E STDP (block-diagonal, O(M_per_hc²) per HC) ---
+        v1_spk_hc = v1_spk.reshape(s.n_hc, s.M_per_hc)
+        # ee_arrivals is (n_hc, M_per_hc, M_per_hc) from vmapped timestep
+
+        stdp_ee_vmap = jax.vmap(
+            delay_aware_ee_stdp_update,
+            in_axes=(0, 0, 0, 0, 0, 0,
+                     None, None, None, None, None, None, None))
+
+        pre_trace_hc, post_trace_hc, dW_hc = stdp_ee_vmap(
+            new_state.ee_pre_trace_hc, new_state.ee_post_trace_hc,
+            ee_arrivals, v1_spk_hc,
+            new_state.W_e_e_hc, s.mask_e_e_hc,
+            s.ee_stdp_decay_pre, s.ee_stdp_decay_post,
+            ee_A_plus_eff, ee_A_minus_eff,
+            s.w_e_e_min, s.w_e_e_max,  # scalar intra-HC ceiling
+            s.ee_stdp_weight_dep)
+
+        W_e_e_hc_new = new_state.W_e_e_hc + dW_hc
+        W_e_e_hc_new = jnp.clip(W_e_e_hc_new, s.w_e_e_min, s.w_e_e_max)
+        W_e_e_hc_new = W_e_e_hc_new * (1.0 - s.eye_per_hc[None, :, :])  # zero diagonal
+
+        return new_state._replace(
+            ee_pre_trace_hc=pre_trace_hc,
+            ee_post_trace_hc=post_trace_hc,
+            W_e_e_hc=W_e_e_hc_new,
+            rate_avg=rate_avg_new,
+        ), v1_spk
+    else:
+        # --- Legacy flat E→E STDP (unchanged for n_hc=1) ---
+        pre_trace, post_trace, dW_ee = delay_aware_ee_stdp_update(
+            new_state.ee_pre_trace, new_state.ee_post_trace,
+            ee_arrivals, v1_spk,
+            new_state.W_e_e, s.mask_e_e,
+            s.ee_stdp_decay_pre, s.ee_stdp_decay_post,
+            ee_A_plus_eff, ee_A_minus_eff,
+            s.w_e_e_min, s.w_e_e_max,  # scalar for n_hc=1
+            s.ee_stdp_weight_dep)
+
+        W_e_e_new = new_state.W_e_e + dW_ee
+        W_e_e_new = jnp.clip(W_e_e_new, s.w_e_e_min, s.w_e_e_max)
+        W_e_e_new = W_e_e_new * (1.0 - s.eye_M)  # zero diagonal
+
+        return new_state._replace(
+            ee_pre_trace=pre_trace,
+            ee_post_trace=post_trace,
+            W_e_e=W_e_e_new,
+            rate_avg=rate_avg_new,
+        ), v1_spk
 
 
 def reset_state_jax(state, static):
@@ -1796,6 +2259,19 @@ def reset_state_jax(state, static):
         stdp_x_post_slow_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
         rate_avg_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
         pv_istdp_x_post_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
+        # Per-HC PV: zero dynamic state, preserve weights
+        pv_v_hc = jnp.full((s.n_hc, s.n_pv_per_hc), v_init, dtype=jnp.float32)
+        pv_u_hc = jnp.full((s.n_hc, s.n_pv_per_hc), s.pv_b * v_init, dtype=jnp.float32)
+        I_pv_hc = jnp.zeros((s.n_hc, s.n_pv_per_hc), dtype=jnp.float32)
+        I_pv_inh_hc = jnp.zeros((s.n_hc, s.n_pv_per_hc), dtype=jnp.float32)
+        g_v1_inh_pv_rise_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
+        g_v1_inh_pv_decay_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
+        # Per-HC E→E: zero traces/buffers/conductances, preserve weights
+        ee_pre_trace_hc = jnp.zeros((s.n_hc, s.M_per_hc, s.M_per_hc), dtype=jnp.float32)
+        ee_post_trace_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
+        delay_buf_ee_hc = jnp.zeros((s.n_hc, s.L_ee, s.M_per_hc), dtype=jnp.float32)
+        g_exc_ee_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
+        drive_acc_ee_hc = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
     else:
         lgn_v_hc = state.lgn_v_hc
         lgn_u_hc = state.lgn_u_hc
@@ -1808,6 +2284,19 @@ def reset_state_jax(state, static):
         stdp_x_post_slow_hc = state.stdp_x_post_slow_hc
         rate_avg_hc = state.rate_avg_hc
         pv_istdp_x_post_hc = state.pv_istdp_x_post_hc
+        # PV per-HC placeholders unchanged
+        pv_v_hc = state.pv_v_hc
+        pv_u_hc = state.pv_u_hc
+        I_pv_hc = state.I_pv_hc
+        I_pv_inh_hc = state.I_pv_inh_hc
+        g_v1_inh_pv_rise_hc = state.g_v1_inh_pv_rise_hc
+        g_v1_inh_pv_decay_hc = state.g_v1_inh_pv_decay_hc
+        # E→E per-HC placeholders unchanged
+        ee_pre_trace_hc = state.ee_pre_trace_hc
+        ee_post_trace_hc = state.ee_post_trace_hc
+        delay_buf_ee_hc = state.delay_buf_ee_hc
+        g_exc_ee_hc = state.g_exc_ee_hc
+        drive_acc_ee_hc = state.drive_acc_ee_hc
 
     return state._replace(
         lgn_v=jnp.full(s.n_lgn, v_init, dtype=jnp.float32),
@@ -1857,6 +2346,19 @@ def reset_state_jax(state, static):
         stdp_x_post_slow_hc=stdp_x_post_slow_hc,
         rate_avg_hc=rate_avg_hc,
         pv_istdp_x_post_hc=pv_istdp_x_post_hc,
+        # Per-HC PV
+        pv_v_hc=pv_v_hc,
+        pv_u_hc=pv_u_hc,
+        I_pv_hc=I_pv_hc,
+        I_pv_inh_hc=I_pv_inh_hc,
+        g_v1_inh_pv_rise_hc=g_v1_inh_pv_rise_hc,
+        g_v1_inh_pv_decay_hc=g_v1_inh_pv_decay_hc,
+        # Per-HC E→E
+        ee_pre_trace_hc=ee_pre_trace_hc,
+        ee_post_trace_hc=ee_post_trace_hc,
+        delay_buf_ee_hc=delay_buf_ee_hc,
+        g_exc_ee_hc=g_exc_ee_hc,
+        drive_acc_ee_hc=drive_acc_ee_hc,
     )
 
 
@@ -2288,6 +2790,8 @@ def _make_segment_runners(static):
             drive_acc_ee=jnp.zeros(s.M, dtype=jnp.float32),
             drive_acc_steps=jnp.int32(0),
         )
+        if s.n_hc > 1:
+            resets['drive_acc_ee_hc'] = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
         state = state._replace(**resets)
 
         def scan_body(carry, inputs):
@@ -2312,6 +2816,8 @@ def _make_segment_runners(static):
             drive_acc_ee=jnp.zeros(s.M, dtype=jnp.float32),
             drive_acc_steps=jnp.int32(0),
         )
+        if s.n_hc > 1:
+            resets['drive_acc_ee_hc'] = jnp.zeros((s.n_hc, s.M_per_hc), dtype=jnp.float32)
         state = state._replace(**resets)
 
         def scan_body(carry, inputs):
@@ -2425,6 +2931,61 @@ def _build_intra_hc_mask(n_hc: int, M_per_hc: int) -> np.ndarray:
     return intra
 
 
+def get_flat_W_e_e(state: SimState, static: StaticConfig) -> jnp.ndarray:
+    """Reconstruct flat (M_total, M_total) W_e_e from per-HC blocks + inter-HC weights.
+
+    For n_hc=1, returns state.W_e_e directly (no copy overhead).
+    For n_hc>1, assembles the block-diagonal intra-HC weights from
+    W_e_e_hc (n_hc, M_per_hc, M_per_hc) and adds the static inter-HC weights.
+
+    Parameters
+    ----------
+    state : SimState
+    static : StaticConfig
+
+    Returns
+    -------
+    W_e_e_flat : (M_total, M_total) jnp.ndarray
+    """
+    if static.n_hc <= 1:
+        return state.W_e_e
+
+    n_hc = static.n_hc
+    M_per_hc = static.M_per_hc
+    M = n_hc * M_per_hc
+    # Build block-diagonal from per-HC blocks
+    # Scatter each (M_per_hc, M_per_hc) block into the (M, M) matrix
+    W_flat = jnp.zeros((M, M), dtype=jnp.float32)
+    for hc in range(n_hc):
+        s_idx = hc * M_per_hc
+        W_flat = W_flat.at[s_idx:s_idx + M_per_hc, s_idx:s_idx + M_per_hc].set(
+            state.W_e_e_hc[hc])
+    # Add inter-HC weights (static, unchanged during simulation)
+    W_flat = W_flat + static.W_e_e_inter_flat
+    return W_flat
+
+
+def get_flat_W_e_e_numpy(state: SimState, static: StaticConfig) -> np.ndarray:
+    """Reconstruct flat (M_total, M_total) W_e_e as a numpy array.
+
+    Same as get_flat_W_e_e but returns numpy for use outside JIT.
+    """
+    if static.n_hc <= 1:
+        return np.array(state.W_e_e)
+
+    n_hc = int(static.n_hc)
+    M_per_hc = int(static.M_per_hc)
+    M = n_hc * M_per_hc
+    W_hc_np = np.array(state.W_e_e_hc)
+    W_inter_np = np.array(static.W_e_e_inter_flat)
+    W_flat = np.zeros((M, M), dtype=np.float32)
+    for hc in range(n_hc):
+        s_idx = hc * M_per_hc
+        W_flat[s_idx:s_idx + M_per_hc, s_idx:s_idx + M_per_hc] = W_hc_np[hc]
+    W_flat += W_inter_np
+    return W_flat
+
+
 def calibrate_ee_drive_jax(
     state: SimState,
     static: StaticConfig,
@@ -2496,6 +3057,9 @@ def calibrate_ee_drive_jax(
     else:
         intra_mask_jax = None  # not needed — all weights are intra-HC
 
+    # For n_hc > 1: also extract per-HC blocks from original weights
+    W_e_e_hc_orig = state.W_e_e_hc  # (n_hc, M_per_hc, M_per_hc) or placeholder
+
     def _build_W_scaled(scale_val):
         """Build W_e_e with intra-HC scaled, inter-HC fixed."""
         if n_hc > 1:
@@ -2503,16 +3067,23 @@ def calibrate_ee_drive_jax(
         else:
             return W_e_e_orig * scale_val * (1.0 - eye_M)
 
+    def _build_W_hc_scaled(scale_val):
+        """Build per-HC W_e_e_hc with intra-HC scaling (for n_hc > 1 only)."""
+        return W_e_e_hc_orig * scale_val
+
     # Use multiple orientations for robust drive fraction measurement
     probe_thetas = [0.0, 45.0, 90.0, 135.0]
 
-    def _measure_drive_frac(W_e_e_scaled):
+    def _measure_drive_frac(W_e_e_scaled, W_e_e_hc_scaled=None):
         """Run probes at multiple orientations and return mean drive fraction."""
         total_ff = 0.0
         total_ee = 0.0
         for i, theta in enumerate(probe_thetas):
             probe_key = jax.random.fold_in(state.rng_key, i)
-            probe_state = state._replace(W_e_e=W_e_e_scaled, rng_key=probe_key)
+            replacements = dict(W_e_e=W_e_e_scaled, rng_key=probe_key)
+            if n_hc > 1 and W_e_e_hc_scaled is not None:
+                replacements['W_e_e_hc'] = W_e_e_hc_scaled
+            probe_state = state._replace(**replacements)
             probe_state = reset_state_jax(probe_state, static)
             probe_after, _ = run_segment_jax(
                 probe_state, static, theta, contrast, False)
@@ -2525,7 +3096,8 @@ def calibrate_ee_drive_jax(
     all_probes = []
     for s in scales:
         W_scaled = _build_W_scaled(s)
-        frac = _measure_drive_frac(W_scaled)
+        W_hc_scaled = _build_W_hc_scaled(s) if n_hc > 1 else None
+        frac = _measure_drive_frac(W_scaled, W_hc_scaled)
         all_probes.append((s, frac))
         print(f"  [calibrate_jax] scale={s:.0f} → drive_frac={frac:.4f}")
         if frac > target_frac * 3:
@@ -2547,7 +3119,8 @@ def calibrate_ee_drive_jax(
         if abs(hi_scale - lo_scale) / max(1e-8, hi_scale) < 0.05:
             break
         W_scaled = _build_W_scaled(mid_scale)
-        mid_frac = _measure_drive_frac(W_scaled)
+        W_hc_scaled = _build_W_hc_scaled(mid_scale) if n_hc > 1 else None
+        mid_frac = _measure_drive_frac(W_scaled, W_hc_scaled)
         all_probes.append((mid_scale, mid_frac))
         print(f"  [calibrate_jax] refine scale={mid_scale:.1f} → "
               f"drive_frac={mid_frac:.4f}")
@@ -2567,7 +3140,10 @@ def calibrate_ee_drive_jax(
 
     def _check_osi(scale_val):
         W_test = _build_W_scaled(scale_val)
-        state_test = state._replace(W_e_e=W_test)
+        replacements = dict(W_e_e=W_test)
+        if n_hc > 1:
+            replacements['W_e_e_hc'] = _build_W_hc_scaled(scale_val)
+        state_test = state._replace(**replacements)
         rates_test = evaluate_tuning_jax(
             state_test, static, thetas_check, repeats=2, contrast=contrast)
         osi_test, _ = compute_osi(rates_test, thetas_check)
@@ -2707,14 +3283,33 @@ def prepare_phaseb_ee(
         print(f"  [prepare_phaseb_ee] n_hc=1: cal_mean={cal_mean:.6f}, "
               f"w_e_e_max={w_max_intra:.4f}")
 
-    state = state._replace(W_e_e=W_e_e_cal)
+    # Update state with calibrated flat weights
+    state_updates = dict(W_e_e=W_e_e_cal)
+
+    # For n_hc > 1: extract per-HC blocks from calibrated weights and update inter-HC in static
+    if n_hc > 1:
+        W_cal_np_full = np.array(W_e_e_cal)
+        W_ee_hc_cal = np.zeros((n_hc, M_per_hc, M_per_hc), dtype=np.float32)
+        W_inter_flat = np.array(W_cal_np_full)
+        for hc in range(n_hc):
+            s_idx = hc * M_per_hc
+            e_idx = s_idx + M_per_hc
+            W_ee_hc_cal[hc] = W_cal_np_full[s_idx:e_idx, s_idx:e_idx]
+            W_inter_flat[s_idx:e_idx, s_idx:e_idx] = 0.0
+        state_updates['W_e_e_hc'] = jnp.array(W_ee_hc_cal)
+
+    state = state._replace(**state_updates)
+
     # Store two scalar ceilings + intra-HC mask for population-specific STDP
-    static = static._replace(
+    static_updates = dict(
         w_e_e_max=w_max_intra,
         w_e_e_max_inter=w_max_inter,
         intra_hc_mask=intra_mask_jax if intra_mask_jax is not None
                       else jnp.zeros((0,), dtype=jnp.float32),
     )
+    if n_hc > 1:
+        static_updates['W_e_e_inter_flat'] = jnp.array(W_inter_flat)
+    static = static._replace(**static_updates)
 
     # Compute per-neuron target total incoming E→E weight for synaptic scaling
     # (still returned for callers that want it, but NOT required — the

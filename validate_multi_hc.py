@@ -594,7 +594,7 @@ def test_jax_per_hc_osi():
         print(f"  (30 JAX segments trained in {train_time:.1f}s)")
 
         # Copy JAX weights back to numpy network for evaluation
-        jax_state_to_numpy_net(state, net)
+        jax_state_to_numpy_net(state, net, static)
 
         # Evaluate per-HC tuning using numpy
         thetas = np.linspace(0, 180, 12, endpoint=False)

@@ -20,7 +20,8 @@ sys.path.insert(0, '.')
 
 from biologically_plausible_v1_stdp import Params, RgcLgnV1Network, compute_osi
 from network_jax import (numpy_net_to_jax_state, run_segment_jax, run_sequence_trial_jax,
-                          evaluate_tuning_jax, calibrate_ee_drive_jax, prepare_phaseb_ee)
+                          evaluate_tuning_jax, calibrate_ee_drive_jax, prepare_phaseb_ee,
+                          get_flat_W_e_e_numpy)
 import jax
 import jax.numpy as jnp
 
@@ -128,7 +129,7 @@ def run_condition(label, n_hc, rf_spacing, seed, fixed_phases):
             state, static, SEQ_THETAS, ELEMENT_MS, ITI_MS, 1.0, **kwargs)
 
         if cp_idx < len(CHECKPOINTS) and k == CHECKPOINTS[cp_idx]:
-            W = np.array(state.W_e_e)
+            W = get_flat_W_e_e_numpy(state, static)
             elapsed = time.perf_counter() - t0b
 
             if n_hc > 1:

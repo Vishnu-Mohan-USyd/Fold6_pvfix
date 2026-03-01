@@ -38,7 +38,7 @@ from biologically_plausible_v1_stdp import Params, RgcLgnV1Network, compute_osi
 from network_jax import (numpy_net_to_jax_state, run_segment_jax,
                           run_sequence_trial_jax, evaluate_tuning_jax,
                           calibrate_ee_drive_jax, prepare_phaseb_ee,
-                          reset_state_jax)
+                          reset_state_jax, get_flat_W_e_e_numpy)
 import jax
 import jax.numpy as jnp
 
@@ -340,7 +340,7 @@ def main():
 
             # F>R measurement (weight-based, instant)
             if do_fr:
-                W = np.array(state.W_e_e)
+                W = get_flat_W_e_e_numpy(state, static)
                 per_hc = compute_per_hc_fr(W, pref, N_HC, M_PER_HC)
                 fr_med = float(np.median(per_hc))
                 frac_gt1 = float(np.mean(per_hc > 1.0))
